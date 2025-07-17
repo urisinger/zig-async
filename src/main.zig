@@ -7,6 +7,8 @@ const EventLoop = @import("EventLoop.zig");
 pub fn main() !void {
     var gpa: std.heap.DebugAllocator(.{}) = .init;
 
+    errdefer gpa.deinit();
+
     const allocator = gpa.allocator();
     var event_loop = EventLoop.init(gpa.allocator());
     var runtime = Fibers.init(allocator, event_loop.io());
@@ -15,7 +17,8 @@ pub fn main() !void {
 
     exec.asyncDetached(run, .{exec});
 
-    std.Thread.sleep(100000000);
+    std.Thread.sleep(10000);
+    runtime.join();
 }
 
 pub fn run(exec: Exec) void {
@@ -27,7 +30,6 @@ pub fn run(exec: Exec) void {
     const read = EventLoop.readFile(exec, file, &res, 0) catch unreachable;
 
     log.info("{} read: {}", .{res[0], read});
-
 }
 
 pub fn run1(exec: Exec) i32 {

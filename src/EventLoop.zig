@@ -17,14 +17,11 @@ const ThreadContext = struct {
     io_uring: IoUring,
 
     pub fn init(event_loop: *EventLoop) ThreadContext {
-        return .{
-            .io_uring = IoUring.init(io_uring_entries, 0) catch unreachable,
-            .event_loop = event_loop
-        };
+        return .{ .io_uring = IoUring.init(io_uring_entries, 0) catch unreachable, .event_loop = event_loop };
     }
 };
 
-pub fn createContext(global_ctx: ?*anyopaque) ?*anyopaque{
+pub fn createContext(global_ctx: ?*anyopaque) ?*anyopaque {
     const event_loop: *EventLoop = @alignCast(@ptrCast(global_ctx));
 
     const thread_ctx = event_loop.allocator.create(ThreadContext) catch unreachable;
@@ -35,13 +32,13 @@ pub fn createContext(global_ctx: ?*anyopaque) ?*anyopaque{
     return @ptrCast(thread_ctx);
 }
 
-pub fn init(allocator: Allocator) EventLoop{
+pub fn init(allocator: Allocator) EventLoop {
     return .{
         .allocator = allocator,
     };
 }
 
-const File = struct{
+const File = struct {
     handle: Handle,
     waker: *anyopaque,
 
@@ -77,7 +74,7 @@ pub fn openFile(exec: Exec, path: []const u8, flags: std.posix.O, mode: std.posi
     // For file opening, we can do it synchronously since it's usually fast
     // In a real implementation, you might want to use io_uring's IORING_OP_OPENAT
     const fd = try std.posix.open(path, flags, mode);
-    
+
     return File{
         .handle = fd,
         .waker = exec.getWaker(),
@@ -87,7 +84,7 @@ pub fn openFile(exec: Exec, path: []const u8, flags: std.posix.O, mode: std.posi
 // Async file read
 pub fn readFile(exec: Exec, file: File, buffer: []u8, offset: u64) !usize {
     const thread_ctx: *ThreadContext = @alignCast(@ptrCast(exec.getLocalContext()));
-    
+
     // Create read operation
     const read_op: ReadOperation = .{
         .base = FileOperation{
@@ -97,18 +94,14 @@ pub fn readFile(exec: Exec, file: File, buffer: []u8, offset: u64) !usize {
         .buffer = buffer,
         .offset = offset,
     };
-    
+
     // Submit read operation to io_uring
     const sqe = try thread_ctx.io_uring.get_sqe();
     sqe.prep_read(file.handle, buffer, offset);
     sqe.user_data = @intFromPtr(&read_op);
-    
-    _ = try thread_ctx.io_uring.submit();
-    
-    // Suspend until the operation completes
+
     exec.@"suspend"();
-    
-    
+
     switch (read_op.base.result) {
         .success => |bytes_read| return bytes_read,
         .err => |err| return err,
@@ -118,7 +111,7 @@ pub fn readFile(exec: Exec, file: File, buffer: []u8, offset: u64) !usize {
 // Async file write
 pub fn writeFile(exec: Exec, file: File, buffer: []const u8, offset: u64) !usize {
     const thread_ctx: *ThreadContext = @alignCast(@ptrCast(exec.getLocalContext()));
-    
+
     var write_op = WriteOperation{
         .base = FileOperation{
             .waker = file.waker,
@@ -127,17 +120,15 @@ pub fn writeFile(exec: Exec, file: File, buffer: []const u8, offset: u64) !usize
         .buffer = buffer,
         .offset = offset,
     };
-    
+
     // Submit write operation to io_uring
     const sqe = try thread_ctx.io_uring.get_sqe();
     sqe.prep_write(file.handle, buffer, offset);
     sqe.user_data = @intFromPtr(&write_op);
-    
-    
+
     // Suspend until the operation completes
     exec.@"suspend"();
-    
-    
+
     switch (write_op.base.result) {
         .success => |bytes_written| return bytes_written,
         .err => |err| return err,
@@ -149,7 +140,7 @@ pub fn closeFile(file: File) void {
     std.posix.close(file.handle);
 }
 
-pub fn io(el: *EventLoop) Exec.Io{
+pub fn io(el: *EventLoop) Exec.Io {
     return .{
         .ctx = el,
         .onPark = &onPark,
@@ -157,30 +148,39 @@ pub fn io(el: *EventLoop) Exec.Io{
     };
 }
 
-fn onPark(global_ctx: ?*anyopaque, exec: Exec) void{
+fn onPark(global_ctx: ?*anyopaque, exec: Exec) void {
     const event_loop: *EventLoop = @alignCast(@ptrCast(global_ctx));
     const thread_ctx: *ThreadContext = @alignCast(@ptrCast(exec.getLocalContext()));
     _ = event_loop;
-    
+
     log.info("parked", .{});
 
     const io_uring = &thread_ctx.io_uring;
-    
+
+    // Check if there are any pending submissions
+    const pending_submissions = io_uring.sq_ready();
+    if (pending_submissions == 0) {
+        return;
+    }
+
+    // Submit pending operations and wait for at least one completion
+    _ = thread_ctx.io_uring.submit_and_wait(1) catch unreachable;
+
     // Wait for completion events
     var cqes: [io_uring_entries]std.os.linux.io_uring_cqe = undefined;
     const completed = io_uring.copy_cqes(&cqes, 1) catch {
         log.err("Failed to get completion events", .{});
         return;
     };
-    
+
     // Process completed operations
     for (cqes[0..completed]) |cqe| {
         const user_data = cqe.user_data;
         if (user_data == 0) continue;
-        
+
         // Cast back to our operation struct
         const base_op: *FileOperation = @ptrFromInt(user_data);
-        
+
         // Set the result based on the completion event
         if (cqe.res >= 0) {
             base_op.result = .{ .success = @intCast(cqe.res) };
@@ -188,9 +188,9 @@ fn onPark(global_ctx: ?*anyopaque, exec: Exec) void{
             const errno = @as(std.posix.E, @enumFromInt(-cqe.res));
             base_op.result = .{ .err = std.posix.unexpectedErrno(errno) };
         }
-        
+
         base_op.completed = true;
-        
+
         // Wake up the suspended future
         exec.wake(base_op.waker);
     }
@@ -202,23 +202,23 @@ fn onPark(global_ctx: ?*anyopaque, exec: Exec) void{
 pub fn readFileAlloc(exec: Exec, allocator: Allocator, path: []const u8) ![]u8 {
     const file = try openFile(exec, path, .{}, 0);
     defer closeFile(file);
-    
+
     // Get file size
     const stat = try std.posix.fstat(file.handle);
     const file_size = @as(usize, @intCast(stat.size));
-    
+
     // Allocate buffer
     const buffer = try allocator.alloc(u8, file_size);
     errdefer allocator.free(buffer);
-    
+
     // Read the entire file
     const bytes_read = try readFile(exec, file, buffer, 0);
-    
+
     if (bytes_read != file_size) {
         allocator.free(buffer);
         return error.IncompleteRead;
     }
-    
+
     return buffer;
 }
 
@@ -226,10 +226,10 @@ pub fn readFileAlloc(exec: Exec, allocator: Allocator, path: []const u8) ![]u8 {
 pub fn writeFileAll(exec: Exec, path: []const u8, data: []const u8) !void {
     const file = try openFile(exec, path, .{ .WRONLY = true, .CREAT = true, .TRUNC = true }, 0o644);
     defer closeFile(file);
-    
+
     var offset: u64 = 0;
     var remaining = data;
-    
+
     while (remaining.len > 0) {
         const bytes_written = try writeFile(exec, file, remaining, offset);
         offset += bytes_written;

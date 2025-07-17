@@ -6,7 +6,7 @@ pub const Io = struct {
     ctx: ?*anyopaque,
 
     // Create local thread context
-    createContext: *const fn(global_ctx: ?*anyopaque) ?*anyopaque,
+    createContext: *const fn (global_ctx: ?*anyopaque) ?*anyopaque,
 
     // This function gets called when an execution thread blocks.
     onPark: *const fn (global_ctx: ?*anyopaque, exec: Exec) void,
@@ -61,7 +61,7 @@ pub const VTable = struct {
     @"suspend": *const fn (ctx: ?*anyopaque) void,
 
     wake: *const fn (ctx: ?*anyopaque, fut: *anyopaque) void,
-    
+
     // Pass what you get from this to wake yourself
     getWaker: *const fn (ctx: ?*anyopaque) *anyopaque,
 
@@ -74,14 +74,14 @@ pub fn @"suspend"(exec: Exec) void {
 }
 
 pub fn wake(exec: Exec, fut: *anyopaque) void {
-   exec.vtable.wake(exec.ctx, fut);
+    exec.vtable.wake(exec.ctx, fut);
 }
 
-pub fn getWaker(exec: Exec) *anyopaque{
+pub fn getWaker(exec: Exec) *anyopaque {
     return exec.vtable.getWaker(exec.ctx);
 }
 
-pub fn getLocalContext(exec: Exec) ?*anyopaque{
+pub fn getLocalContext(exec: Exec) ?*anyopaque {
     return exec.vtable.getLocalContext(exec.ctx);
 }
 
