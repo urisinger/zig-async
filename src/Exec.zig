@@ -48,16 +48,12 @@ pub const VTable = struct {
 
     // Suspends the future until Io wakes it up
     @"suspend": *const fn (ctx: ?*anyopaque) void,
-
-    setIo: *const fn (ctx: ?*anyopaque, io: Io) void,
 };
 
-pub const Io = struct {
-    ctx: ?*anyopaque,
-
-    // This function gets called when an execution thread blocks.
-    onPark: *const fn (ctx: ?*anyopaque, wake: *const fn (fut: *AnyFuture) void) void,
-};
+pub fn @"suspend"(exec: Exec) void {
+    std.log.debug("suspended fiber", .{});
+    exec.vtable.@"suspend"(exec.ctx);
+}
 
 pub const AnyFuture = opaque {};
 
@@ -68,7 +64,7 @@ pub fn Future(Result: type) type {
 
         pub fn @"await"(f: *@This(), exec: Exec) Result {
             const any_future = f.any_future orelse return f.result;
-            exec.vtable.@"await"(exec.userdata, any_future, @ptrCast((&f.result)[0..1]), .of(Result));
+            exec.vtable.@"await"(exec.ctx, any_future, if (@sizeOf(Result) == 0) &.{} else @ptrCast((&f.result)[0..1]), std.mem.Alignment.fromByteUnits(@alignOf(Result)));
             f.any_future = null;
             return f.result;
         }
@@ -103,11 +99,52 @@ pub inline fn @"async"(exec: Exec, function: anytype, args: std.meta.ArgsTuple(@
     var future: Future(Result) = undefined;
     future.any_future = exec.vtable.@"async"(
         exec.ctx,
-        @ptrCast((&future.result)[0..1]),
-        .of(Result),
+        if (@sizeOf(Result) == 0) &.{} else @ptrCast((&future.result)[0..1]),
+        std.mem.Alignment.fromByteUnits(@alignOf(Result)),
         if (@sizeOf(Args) == 0) &.{} else @ptrCast((&args)[0..1]),
-        .of(Args),
+        std.mem.Alignment.fromByteUnits(@alignOf(Args)),
         TypeErased.start,
     );
     return future;
+}
+/// Given a struct with each field a `*Future`, returns a union with the same
+/// fields, each field type the future's result.
+pub fn SelectUnion(S: type) type {
+    const struct_fields = @typeInfo(S).@"struct".fields;
+    var fields: [struct_fields.len]std.builtin.Type.UnionField = undefined;
+    for (&fields, struct_fields) |*union_field, struct_field| {
+        const F = @typeInfo(struct_field.type).pointer.child;
+        const Result = @TypeOf(@as(F, undefined).result);
+        union_field.* = .{
+            .name = struct_field.name,
+            .type = Result,
+            .alignment = struct_field.alignment,
+        };
+    }
+    return @Type(.{ .@"union" = .{
+        .layout = .auto,
+        .tag_type = std.meta.FieldEnum(S),
+        .fields = &fields,
+        .decls = &.{},
+    } });
+}
+
+/// `s` is a struct with every field a `*Future(T)`, where `T` can be any type,
+/// and can be different for each field.
+pub fn select(exec: Exec, s: anytype) SelectUnion(@TypeOf(s)) {
+    const U = SelectUnion(@TypeOf(s));
+    const S = @TypeOf(s);
+    const fields = @typeInfo(S).@"struct".fields;
+    var futures: [fields.len]*AnyFuture = undefined;
+    inline for (fields, &futures) |field, *any_future| {
+        const future = @field(s, field.name);
+        any_future.* = future.any_future orelse return @unionInit(U, field.name, future.result);
+    }
+    switch (exec.vtable.select(exec.ctx, &futures)) {
+        inline 0...(fields.len - 1) => |selected_index| {
+            const field_name = fields[selected_index].name;
+            return @unionInit(U, field_name, @field(s, field_name).@"await"(exec));
+        },
+        else => unreachable,
+    }
 }
