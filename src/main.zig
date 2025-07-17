@@ -7,9 +7,8 @@ const EventLoop = @import("EventLoop.zig");
 pub fn main() !void {
     var gpa: std.heap.DebugAllocator(.{}) = .init;
 
-    errdefer gpa.deinit();
-
     const allocator = gpa.allocator();
+
     var event_loop = EventLoop.init(gpa.allocator());
     var runtime = Fibers.init(allocator, event_loop.io());
 
@@ -17,19 +16,24 @@ pub fn main() !void {
 
     exec.asyncDetached(run, .{exec});
 
-    std.Thread.sleep(10000);
     runtime.join();
+
+    runtime.deinit();
+
+    const check = gpa.deinit();
+    if (check == .leak) {
+        std.log.err("leak", .{});
+    }
 }
 
 pub fn run(exec: Exec) void {
-
-    const file = EventLoop.openFile(exec, "/dev/random", .{ .ACCMODE = .RDWR}, 0) catch unreachable;
+    const file = EventLoop.openFile(exec, "/dev/random", .{ .ACCMODE = .RDWR }, 0) catch unreachable;
 
     var res: [10]u8 = undefined;
     @memset(&res, 1);
     const read = EventLoop.readFile(exec, file, &res, 0) catch unreachable;
 
-    log.info("{} read: {}", .{res[0], read});
+    log.info("{} read: {}", .{ res[0], read });
 }
 
 pub fn run1(exec: Exec) i32 {

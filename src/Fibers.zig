@@ -9,11 +9,6 @@ const Fibers = @This();
 
 allocator: std.mem.Allocator,
 
-free_fibers: struct {
-    mutex: std.Thread.Mutex,
-    list: ?*Fiber,
-},
-
 threads: struct {
     mutex: std.Thread.Mutex,
     list: []std.Thread,
@@ -36,10 +31,6 @@ pub fn init(allocator: std.mem.Allocator, io: Exec.Io) Fibers {
     return .{
         .allocator = allocator,
 
-        .free_fibers = .{
-            .mutex = .{},
-            .list = null,
-        },
         .threads = .{
             .mutex = .{},
             .list = &[_]std.Thread{},
@@ -49,12 +40,22 @@ pub fn init(allocator: std.mem.Allocator, io: Exec.Io) Fibers {
     };
 }
 
+pub fn deinit(self: *Fibers) void {
+    self.threads.mutex.lock();
+    self.allocator.free(self.threads.list);
+    self.threads.mutex.unlock();
+}
+
 pub fn join(self: *Fibers) void {
     self.threads.mutex.lock();
-    for (self.threads.list) |thread| {
+    const threads_copy = self.allocator.dupe(std.Thread, self.threads.list) catch unreachable;
+    self.threads.mutex.unlock();
+
+    for (threads_copy) |thread| {
         thread.join();
     }
-    self.threads.mutex.unlock();
+
+    self.allocator.free(threads_copy);
 }
 
 pub fn exec(self: *Fibers) Exec {
@@ -140,23 +141,26 @@ const Fiber = struct {
 
     /// Initialize a Fiber: alloc a stack, set up a context that will
     pub fn init(
+        self: *Fiber,
         allocator: std.mem.Allocator,
         stack_size: usize,
         entry: *const fn (*anyopaque) void,
         arg: *anyopaque,
-    ) !*Fiber {
+    ) !void {
         const stack = try allocator.alloc(usize, @divExact(stack_size, @sizeOf(usize)));
-        var f = try allocator.create(Fiber);
-        f.stack = stack;
-        f.entry = entry;
-        f.arg = arg;
+        self.stack = stack;
+        self.entry = entry;
+        self.arg = arg;
 
         const top = @intFromPtr(stack.ptr) + stack.len * @sizeOf(usize);
-        f.ctx = .init(@intFromPtr(&fiberTrampoline), top);
+        self.ctx = .init(@intFromPtr(&fiberTrampoline), top);
 
-        f.next_fiber = f;
-        f.prev_fiber = f;
-        return f;
+        self.next_fiber = self;
+        self.prev_fiber = self;
+    }
+
+    pub fn deinit(self: *Fiber, allocator: std.mem.Allocator) void {
+        allocator.free(self.stack);
     }
 
     pub fn block(fiber: *Fiber) void {
@@ -289,11 +293,13 @@ const Thread = struct {
         }
     }
 
-    fn entry(rt: *Fibers, context_buf: []u8, start: *const fn (context: *const anyopaque) void) void {
-        const main_fiber = Fiber.init(rt.allocator, 1024 * 1024, start, @ptrCast(context_buf.ptr)) catch unreachable;
+    fn entry(rt: *Fibers, context_buf: []u8, ca: std.mem.Alignment, start: *const fn (context: *const anyopaque) void) void {
+        var main_fiber: Fiber = undefined;
+        main_fiber.init(rt.allocator, 1024 * 1024, start, @ptrCast(context_buf.ptr)) catch unreachable;
+
         var t: Thread = .{
             .rt = rt,
-            .running_queue = main_fiber,
+            .running_queue = &main_fiber,
             .idle_context = .{},
             .io_ctx = rt.io.createContext(rt.io.ctx),
         };
@@ -307,6 +313,9 @@ const Thread = struct {
 
             rt.io.onPark(rt.io.ctx, rt.exec());
         }
+
+        rt.allocator.rawFree(context_buf, ca, @returnAddress());
+        main_fiber.deinit(rt.allocator);
     }
 };
 
@@ -329,10 +338,11 @@ fn getLocalContext(ctx: ?*anyopaque) ?*anyopaque {
 }
 
 const AsyncTask = struct {
-    fiber: *Fiber,
+    fiber: Fiber,
     start: *const fn (context: *const anyopaque, result: *anyopaque) void,
     result_slice: []u8,
     context_buf: []u8,
+    context_alignment: std.mem.Alignment,
     waiter: ?*Fiber,
 
     finished: bool = false,
@@ -346,6 +356,12 @@ const AsyncTask = struct {
         }
         task.waiter = null;
         task.finished = true;
+    }
+
+    fn deinit(self: *AsyncTask, allocator: std.mem.Allocator, result_alignment: std.mem.Alignment) void {
+        self.fiber.deinit(allocator);
+        allocator.rawFree(self.result_slice, result_alignment, @returnAddress());
+        allocator.rawFree(self.context_buf, self.context_alignment, @returnAddress());
     }
 };
 
@@ -367,23 +383,27 @@ fn @"async"(
     task.result_slice = if (result.len == 0)
         &[_]u8{}
     else
-        (el.allocator.rawAlloc(result.len, ra, 0) orelse unreachable)[0..result.len];
+        (el.allocator.rawAlloc(result.len, ra, @returnAddress()) orelse unreachable)[0..result.len];
 
     task.context_buf = if (context.len == 0)
         &[_]u8{}
     else
-        (el.allocator.rawAlloc(context.len, ca, 0) orelse unreachable)[0..context.len];
+        (el.allocator.rawAlloc(context.len, ca, @returnAddress()) orelse unreachable)[0..context.len];
 
     @memcpy(task.context_buf, context);
 
     task.waiter = null;
     task.start = start;
 
-    task.fiber = Fiber.init(el.allocator, 1024 * 1024, AsyncTask.call, @ptrCast(task)) catch unreachable;
+    var fiber: Fiber = undefined;
+    fiber.init(el.allocator, 1024 * 1024, AsyncTask.call, @ptrCast(task)) catch unreachable;
+    task.fiber = fiber;
+    task.context_alignment = ca;
+
     task.finished = false;
 
     const t = Thread.current();
-    t.insertFiber(task.fiber);
+    t.insertFiber(&task.fiber);
 
     return @ptrCast(task);
 }
@@ -397,7 +417,6 @@ fn @"await"(
     result: []u8,
     ra: std.mem.Alignment,
 ) void {
-    _ = ra;
     const ev: *Fibers = @alignCast(@ptrCast(ctx.?));
     const task: *AsyncTask = @alignCast(@ptrCast(any_future));
 
@@ -411,17 +430,8 @@ fn @"await"(
     // when resumed, result has been written in-place:
     @memcpy(result, task.result_slice);
 
-    // Only now can we free the fiber.
-    ev.free_fibers.mutex.lock();
-    {
-        if (ev.free_fibers.list) |free_fibers| {
-            free_fibers.insert(task.fiber);
-        } else {
-            ev.free_fibers.list = task.fiber;
-        }
-    }
-    ev.free_fibers.mutex.unlock();
-
+    // Only now can we free the task.
+    task.deinit(ev.allocator, ra);
     ev.allocator.destroy(task);
 }
 
@@ -446,6 +456,7 @@ fn asyncDetached(
     const thread = std.Thread.spawn(.{}, Thread.entry, .{
         el,
         context_buf,
+        ca,
         start,
     }) catch unreachable;
     el.threads.mutex.lock();

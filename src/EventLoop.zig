@@ -151,7 +151,6 @@ pub fn io(el: *EventLoop) Exec.Io {
 fn onPark(global_ctx: ?*anyopaque, exec: Exec) void {
     const event_loop: *EventLoop = @alignCast(@ptrCast(global_ctx));
     const thread_ctx: *ThreadContext = @alignCast(@ptrCast(exec.getLocalContext()));
-    _ = event_loop;
 
     log.info("parked", .{});
 
@@ -160,6 +159,7 @@ fn onPark(global_ctx: ?*anyopaque, exec: Exec) void {
     // Check if there are any pending submissions
     const pending_submissions = io_uring.sq_ready();
     if (pending_submissions == 0) {
+        event_loop.allocator.destroy(thread_ctx);
         return;
     }
 
