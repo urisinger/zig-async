@@ -27,13 +27,15 @@ pub fn main() !void {
 }
 
 pub fn run(exec: Exec) void {
-    const file = EventLoop.openFile(exec, "/dev/random", .{ .ACCMODE = .RDWR }, 0) catch unreachable;
+    var fut1 = exec.@"async"(run1, .{exec});
+    var fut2 = exec.@"async"(run2, .{exec});
+    var fut3 = exec.@"async"(run3, .{exec});
 
-    var res: [10]u8 = undefined;
-    @memset(&res, 1);
-    const read = EventLoop.readFile(exec, file, &res, 0) catch unreachable;
+    _ = fut3.@"await"(exec);
+    _ = fut1.@"await"(exec);
+    _ = fut2.@"await"(exec);
 
-    log.info("{} read: {}", .{ res[0], read });
+    log.info("main finished", .{});
 }
 
 pub fn run1(exec: Exec) i32 {
@@ -48,4 +50,24 @@ pub fn run2(exec: Exec) i32 {
     log.info("future 2 running", .{});
 
     return 2;
+}
+
+pub fn run3(exec: Exec) usize {
+    log.info("future 3 running", .{});
+
+    const file = exec.open("/dev/random", .{ .mode = .read_only }) catch unreachable;
+    var res: [10]u8 = undefined;
+    @memset(&res, 1);
+    const read = file.read(
+        &res,
+    ) catch unreachable;
+
+    file.close();
+
+    log.info("read: {} bytes", .{read});
+
+    for (res) |c| {
+        log.info("{}", .{c});
+    }
+    return read;
 }

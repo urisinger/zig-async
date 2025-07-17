@@ -1,5 +1,6 @@
 const std = @import("std");
 const Exec = @import("Exec.zig");
+const Io = Exec.Io;
 
 const log = std.log.scoped(.EventLoop);
 
@@ -38,114 +39,127 @@ pub fn init(allocator: Allocator) EventLoop {
     };
 }
 
-const File = struct {
-    handle: Handle,
-    waker: *anyopaque,
-
-    pub const Handle = std.posix.fd_t;
-};
-
 // File operation structures for async operations
-const FileOperation = struct {
-    waker: *anyopaque,
-    completed: bool = false,
-    result: union(enum) {
-        success: usize, // bytes read/written
-        err: std.posix.WriteError,
-    } = .{ .success = 0 },
+const Operation = struct { waker: *anyopaque, result: i32 };
+
+const vtable: Io.VTable = .{
+    .createContext = createContext,
+    .onPark = onPark,
+    .openFile = openFile,
+    .closeFile = closeFile,
+    .pread = pread,
+    .pwrite = pwrite,
 };
 
-const ReadOperation = struct {
-    base: FileOperation,
-    fd: std.posix.fd_t,
-    buffer: []u8,
-    offset: u64,
-};
-
-const WriteOperation = struct {
-    base: FileOperation,
-    fd: std.posix.fd_t,
-    buffer: []const u8,
-    offset: u64,
-};
+pub fn io(el: *EventLoop) Exec.Io {
+    return .{
+        .ctx = el,
+        .vtable = &vtable,
+    };
+}
 
 // Open file asynchronously
-pub fn openFile(exec: Exec, path: []const u8, flags: std.posix.O, mode: std.posix.mode_t) !File {
-    // For file opening, we can do it synchronously since it's usually fast
-    // In a real implementation, you might want to use io_uring's IORING_OP_OPENAT
-    const fd = try std.posix.open(path, flags, mode);
+pub fn openFile(ctx: ?*anyopaque, exec: Exec, path: []const u8, flags: Io.File.OpenFlags) Io.File.OpenError!Io.File {
+    _ = ctx;
+    var os_flags: std.posix.O = .{
+        .ACCMODE = switch (flags.mode) {
+            .read_only => .RDONLY,
+            .write_only => .WRONLY,
+            .read_write => .RDWR,
+        },
+    };
 
-    return File{
+    if (@hasField(std.posix.O, "CLOEXEC")) os_flags.CLOEXEC = true;
+    if (@hasField(std.posix.O, "LARGEFILE")) os_flags.LARGEFILE = true;
+    if (@hasField(std.posix.O, "NOCTTY")) os_flags.NOCTTY = !flags.allow_ctty;
+
+    const fd = try std.posix.open(path, os_flags, 0);
+
+    return .{
         .handle = fd,
-        .waker = exec.getWaker(),
+        .exec = exec,
     };
 }
 
 // Async file read
-pub fn readFile(exec: Exec, file: File, buffer: []u8, offset: u64) !usize {
+pub fn pread(ctx: ?*anyopaque, exec: Exec, file: Io.File, buffer: []u8, offset: std.posix.off_t) Io.File.PReadError!usize {
+    _ = ctx;
     const thread_ctx: *ThreadContext = @alignCast(@ptrCast(exec.getLocalContext()));
 
     // Create read operation
-    const read_op: ReadOperation = .{
-        .base = FileOperation{
-            .waker = file.waker,
-        },
-        .fd = file.handle,
-        .buffer = buffer,
-        .offset = offset,
+    const read_op: Operation = .{
+        .waker = exec.getWaker(),
+        .result = 0,
     };
 
     // Submit read operation to io_uring
-    const sqe = try thread_ctx.io_uring.get_sqe();
-    sqe.prep_read(file.handle, buffer, offset);
+    const sqe = thread_ctx.io_uring.get_sqe() catch {
+        return error.SystemResources;
+    };
+    sqe.prep_read(file.handle, buffer, @bitCast(offset));
     sqe.user_data = @intFromPtr(&read_op);
 
     exec.@"suspend"();
 
-    switch (read_op.base.result) {
-        .success => |bytes_read| return bytes_read,
-        .err => |err| return err,
+    switch (errno(read_op.result)) {
+        .SUCCESS => return @as(u32, @bitCast(read_op.result)),
+        .INTR => unreachable,
+        .CANCELED => return error.Canceled,
+
+        .INVAL => unreachable,
+        .FAULT => unreachable,
+        .NOENT => return error.ProcessNotFound,
+        .AGAIN => return error.WouldBlock,
+        else => |err| return std.posix.unexpectedErrno(err),
     }
 }
 
 // Async file write
-pub fn writeFile(exec: Exec, file: File, buffer: []const u8, offset: u64) !usize {
+pub fn pwrite(ctx: ?*anyopaque, exec: Exec, file: Io.File, buffer: []const u8, offset: std.posix.off_t) Io.File.PWriteError!usize {
+    _ = ctx;
     const thread_ctx: *ThreadContext = @alignCast(@ptrCast(exec.getLocalContext()));
 
-    var write_op = WriteOperation{
-        .base = FileOperation{
-            .waker = file.waker,
-        },
-        .fd = file.handle,
-        .buffer = buffer,
-        .offset = offset,
+    var write_op: Operation = .{
+        .waker = exec.getWaker(),
+        .result = 0,
     };
 
     // Submit write operation to io_uring
-    const sqe = try thread_ctx.io_uring.get_sqe();
-    sqe.prep_write(file.handle, buffer, offset);
+    const sqe = thread_ctx.io_uring.get_sqe() catch {
+        return error.SystemResources;
+    };
+    sqe.prep_write(file.handle, buffer, @bitCast(offset));
     sqe.user_data = @intFromPtr(&write_op);
 
     // Suspend until the operation completes
     exec.@"suspend"();
 
-    switch (write_op.base.result) {
-        .success => |bytes_written| return bytes_written,
-        .err => |err| return err,
+    switch (errno(write_op.result)) {
+        .SUCCESS => return @as(u32, @bitCast(write_op.result)),
+        .INTR => unreachable,
+        .INVAL => unreachable,
+        .FAULT => unreachable,
+        .AGAIN => unreachable,
+        .BADF => return error.NotOpenForWriting, // can be a race condition.
+        .DESTADDRREQ => unreachable, // `connect` was never called.
+        .DQUOT => return error.DiskQuota,
+        .FBIG => return error.FileTooBig,
+        .IO => return error.InputOutput,
+        .NOSPC => return error.NoSpaceLeft,
+        .PERM => return error.AccessDenied,
+        .PIPE => return error.BrokenPipe,
+        .NXIO => return error.Unseekable,
+        .SPIPE => return error.Unseekable,
+        .OVERFLOW => return error.Unseekable,
+        else => |err| return std.posix.unexpectedErrno(err),
     }
 }
 
 // Close file
-pub fn closeFile(file: File) void {
+pub fn closeFile(ctx: ?*anyopaque, exec: Exec, file: Io.File) void {
+    _ = ctx;
+    _ = exec;
     std.posix.close(file.handle);
-}
-
-pub fn io(el: *EventLoop) Exec.Io {
-    return .{
-        .ctx = el,
-        .onPark = &onPark,
-        .createContext = createContext,
-    };
 }
 
 fn onPark(global_ctx: ?*anyopaque, exec: Exec) void {
@@ -179,60 +193,16 @@ fn onPark(global_ctx: ?*anyopaque, exec: Exec) void {
         if (user_data == 0) continue;
 
         // Cast back to our operation struct
-        const base_op: *FileOperation = @ptrFromInt(user_data);
+        const base_op: *Operation = @ptrFromInt(user_data);
 
         // Set the result based on the completion event
-        if (cqe.res >= 0) {
-            base_op.result = .{ .success = @intCast(cqe.res) };
-        } else {
-            const errno = @as(std.posix.E, @enumFromInt(-cqe.res));
-            base_op.result = .{ .err = std.posix.unexpectedErrno(errno) };
-        }
-
-        base_op.completed = true;
+        base_op.result = cqe.res;
 
         // Wake up the suspended future
         exec.wake(base_op.waker);
     }
 }
 
-// Utility functions for common file operations
-
-// Read entire file into allocated buffer
-pub fn readFileAlloc(exec: Exec, allocator: Allocator, path: []const u8) ![]u8 {
-    const file = try openFile(exec, path, .{}, 0);
-    defer closeFile(file);
-
-    // Get file size
-    const stat = try std.posix.fstat(file.handle);
-    const file_size = @as(usize, @intCast(stat.size));
-
-    // Allocate buffer
-    const buffer = try allocator.alloc(u8, file_size);
-    errdefer allocator.free(buffer);
-
-    // Read the entire file
-    const bytes_read = try readFile(exec, file, buffer, 0);
-
-    if (bytes_read != file_size) {
-        allocator.free(buffer);
-        return error.IncompleteRead;
-    }
-
-    return buffer;
-}
-
-// Write entire buffer to file
-pub fn writeFileAll(exec: Exec, path: []const u8, data: []const u8) !void {
-    const file = try openFile(exec, path, .{ .WRONLY = true, .CREAT = true, .TRUNC = true }, 0o644);
-    defer closeFile(file);
-
-    var offset: u64 = 0;
-    var remaining = data;
-
-    while (remaining.len > 0) {
-        const bytes_written = try writeFile(exec, file, remaining, offset);
-        offset += bytes_written;
-        remaining = remaining[bytes_written..];
-    }
+fn errno(signed: i32) std.posix.E {
+    return std.posix.errno(@as(isize, signed));
 }

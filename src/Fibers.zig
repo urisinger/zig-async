@@ -15,7 +15,6 @@ threads: struct {
 },
 
 io: Exec.Io,
-
 const vtable: Exec.VTable = .{
     .@"async" = @"async",
     .asyncDetached = asyncDetached,
@@ -62,6 +61,7 @@ pub fn exec(self: *Fibers) Exec {
     return .{
         .vtable = &vtable,
         .ctx = @ptrCast(self),
+        .io = self.io,
     };
 }
 
@@ -264,8 +264,10 @@ const Thread = struct {
 
     fn insertFiber(t: *Thread, fib: *Fiber) void {
         if (t.running_queue) |running_queue| {
-            running_queue.insert(fib);
+            running_queue.insertBefore(fib);
         } else {
+            fib.next_fiber = fib;
+            fib.prev_fiber = fib;
             t.running_queue = fib;
         }
     }
@@ -274,6 +276,7 @@ const Thread = struct {
         if (t.running_queue) |fib| {
             return &fib.ctx;
         } else {
+            log.info("no running queue", .{});
             return &t.idle_context;
         }
     }
@@ -301,7 +304,7 @@ const Thread = struct {
             .rt = rt,
             .running_queue = &main_fiber,
             .idle_context = .{},
-            .io_ctx = rt.io.createContext(rt.io.ctx),
+            .io_ctx = rt.io.vtable.createContext(rt.io.ctx),
         };
         self = &t;
 
@@ -311,7 +314,7 @@ const Thread = struct {
 
             contextSwitch(old_ctx, new_ctx);
 
-            rt.io.onPark(rt.io.ctx, rt.exec());
+            rt.io.vtable.onPark(rt.io.ctx, rt.exec());
         }
 
         rt.allocator.rawFree(context_buf, ca, @returnAddress());

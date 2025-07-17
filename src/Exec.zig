@@ -1,19 +1,87 @@
 const std = @import("std");
+const fs = std.fs;
 
 const Exec = @This();
 
+const FileHandle = opaque {};
+
 pub const Io = struct {
+    pub const VTable = struct {
+        createContext: *const fn (global_ctx: ?*anyopaque) ?*anyopaque,
+        onPark: *const fn (global_ctx: ?*anyopaque, exec: Exec) void,
+
+        //createFile: *const fn (global_ctx: ?*anyopaque, exec: Exec, path: []const u8, flags: File.CreateFlags) File.OpenError!File,
+        openFile: *const fn (global_ctx: ?*anyopaque, exec: Exec, path: []const u8, flags: File.OpenFlags) File.OpenError!File,
+        closeFile: *const fn (global_ctx: ?*anyopaque, exec: Exec, File) void,
+        pread: *const fn (global_ctx: ?*anyopaque, exec: Exec, file: File, buffer: []u8, offset: std.posix.off_t) File.PReadError!usize,
+        pwrite: *const fn (global_ctx: ?*anyopaque, exec: Exec, file: File, buffer: []const u8, offset: std.posix.off_t) File.PWriteError!usize,
+    };
+
+    pub const File = struct {
+        handle: Handle,
+        exec: Exec,
+
+        pub const Handle = std.posix.fd_t;
+
+        pub const OpenFlags = fs.File.OpenFlags;
+        pub const CreateFlags = fs.File.CreateFlags;
+
+        pub const OpenError = fs.File.OpenError;
+
+        pub fn close(file: File) void {
+            return file.exec.io.vtable.closeFile(file.exec.io.ctx, file.exec, file);
+        }
+
+        pub const ReadError = fs.File.ReadError;
+
+        pub fn read(file: File, buffer: []u8) ReadError!usize {
+            return @errorCast(file.pread(buffer, -1));
+        }
+
+        pub const PReadError = fs.File.PReadError;
+
+        pub fn pread(file: File, buffer: []u8, offset: std.posix.off_t) PReadError!usize {
+            return file.exec.io.vtable.pread(file.exec.io.ctx, file.exec, file, buffer, offset);
+        }
+
+        pub const WriteError = fs.File.WriteError;
+
+        pub fn write(file: File, buffer: []const u8) WriteError!usize {
+            return @errorCast(file.pwrite(buffer, -1));
+        }
+
+        pub const PWriteError = fs.File.PWriteError;
+
+        pub fn pwrite(file: File, buffer: []const u8, offset: std.posix.off_t) PWriteError!usize {
+            return file.exec.io.vtable.pwrite(file.exec.io.ctx, file.exec, file, buffer, offset);
+        }
+
+        pub fn writeAll(file: File, bytes: []const u8) WriteError!void {
+            var index: usize = 0;
+            while (index < bytes.len) {
+                index += try file.write(bytes[index..]);
+            }
+        }
+
+        pub fn readAll(file: File, buffer: []u8) ReadError!usize {
+            var index: usize = 0;
+            while (index != buffer.len) {
+                const amt = try file.read(buffer[index..]);
+                if (amt == 0) break;
+                index += amt;
+            }
+            return index;
+        }
+    };
     ctx: ?*anyopaque,
 
-    // Create local thread context
-    createContext: *const fn (global_ctx: ?*anyopaque) ?*anyopaque,
-
-    // This function gets called when an execution thread blocks.
-    onPark: *const fn (global_ctx: ?*anyopaque, exec: Exec) void,
+    vtable: *const @This().VTable,
 };
 
 ctx: ?*anyopaque,
 vtable: *const VTable,
+
+io: Io,
 
 pub const VTable = struct {
     @"async": *const fn (
@@ -177,4 +245,8 @@ pub fn select(exec: Exec, s: anytype) SelectUnion(@TypeOf(s)) {
         },
         else => unreachable,
     }
+}
+
+pub fn open(exec: Exec, path: []const u8, flags: Io.File.OpenFlags) !Io.File {
+    return exec.io.vtable.openFile(exec.io.ctx, exec, path, flags);
 }
