@@ -2,6 +2,16 @@ const std = @import("std");
 
 const Exec = @This();
 
+pub const Io = struct {
+    ctx: ?*anyopaque,
+
+    // Create local thread context
+    createContext: *const fn(global_ctx: ?*anyopaque) ?*anyopaque,
+
+    // This function gets called when an execution thread blocks.
+    onPark: *const fn (global_ctx: ?*anyopaque, exec: Exec) void,
+};
+
 ctx: ?*anyopaque,
 vtable: *const VTable,
 
@@ -30,6 +40,7 @@ pub const VTable = struct {
         context_alignment: std.mem.Alignment,
         start: *const fn (context: *const anyopaque) void,
     ) void,
+
     /// This function is only called when `async` returns a non-null value.
     ///
     /// Thread-safe.
@@ -46,13 +57,32 @@ pub const VTable = struct {
 
     select: *const fn (ctx: ?*anyopaque, futures: []const *AnyFuture) usize,
 
-    // Suspends the future until Io wakes it up
+    // Suspends this future until Io wakes it up
     @"suspend": *const fn (ctx: ?*anyopaque) void,
+
+    wake: *const fn (ctx: ?*anyopaque, fut: *anyopaque) void,
+    
+    // Pass what you get from this to wake yourself
+    getWaker: *const fn (ctx: ?*anyopaque) *anyopaque,
+
+    // Get the local context for io
+    getLocalContext: *const fn (ctx: ?*anyopaque) ?*anyopaque,
 };
 
 pub fn @"suspend"(exec: Exec) void {
-    std.log.debug("suspended fiber", .{});
     exec.vtable.@"suspend"(exec.ctx);
+}
+
+pub fn wake(exec: Exec, fut: *anyopaque) void {
+   exec.vtable.wake(exec.ctx, fut);
+}
+
+pub fn getWaker(exec: Exec) *anyopaque{
+    return exec.vtable.getWaker(exec.ctx);
+}
+
+pub fn getLocalContext(exec: Exec) ?*anyopaque{
+    return exec.vtable.getLocalContext(exec.ctx);
 }
 
 pub const AnyFuture = opaque {};

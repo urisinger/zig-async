@@ -1,512 +1,238 @@
 const std = @import("std");
-const builtin = @import("builtin");
 const Exec = @import("Exec.zig");
 
-const assert = std.debug.assert;
+const log = std.log.scoped(.EventLoop);
+
+const IoUring = std.os.linux.IoUring;
+const Allocator = std.mem.Allocator;
 
 const EventLoop = @This();
 
-pub const Io = struct {
-    ctx: ?*anyopaque,
+const io_uring_entries = 64;
 
-    // This function gets called when an execution thread blocks.
-    onPark: *const fn (ctx: ?*anyopaque, wake: *const fn (fut: *Exec.AnyFuture) void) void,
+allocator: Allocator,
+
+const ThreadContext = struct {
+    event_loop: *EventLoop,
+    io_uring: IoUring,
+
+    pub fn init(event_loop: *EventLoop) ThreadContext {
+        return .{
+            .io_uring = IoUring.init(io_uring_entries, 0) catch unreachable,
+            .event_loop = event_loop
+        };
+    }
 };
 
-allocator: std.mem.Allocator,
+pub fn createContext(global_ctx: ?*anyopaque) ?*anyopaque{
+    const event_loop: *EventLoop = @alignCast(@ptrCast(global_ctx));
 
-free_fibers: struct {
-    mutex: std.Thread.Mutex,
-    list: ?*Fiber,
-},
+    const thread_ctx = event_loop.allocator.create(ThreadContext) catch unreachable;
+    thread_ctx.* = ThreadContext.init(event_loop);
 
-io: Io,
+    log.info("Created event loop context", .{});
 
-const vtable: Exec.VTable = .{
-    .@"async" = asyncImpl,
-    .asyncDetached = asyncDetachedImpl,
-    .@"await" = awaitImpl,
-    .@"suspend" = suspendImpl,
-    .select = selectImpl,
-};
+    return @ptrCast(thread_ctx);
+}
 
-pub fn init(allocator: std.mem.Allocator, io: Io) EventLoop {
+pub fn init(allocator: Allocator) EventLoop{
     return .{
         .allocator = allocator,
-
-        .free_fibers = .{
-            .mutex = .{},
-            .list = null,
-        },
-
-        .io = io,
     };
 }
 
-pub fn exec(self: *EventLoop) Exec {
-    return .{
-        .vtable = &vtable,
-        .ctx = @ptrCast(self),
-    };
-}
+const File = struct{
+    handle: Handle,
+    waker: *anyopaque,
 
-const Context = switch (builtin.cpu.arch) {
-    .x86_64 => packed struct {
-        rsp: u64 = 0,
-        rbp: u64 = 0,
-        rip: u64 = 0,
-        rbx: u64 = 0,
-        r12: u64 = 0,
-        r13: u64 = 0,
-        r14: u64 = 0,
-        r15: u64 = 0,
-
-        fn init(entry_rip: usize, stack: usize) @This() {
-            return .{
-                .rsp = stack - 8,
-                .rbp = 0,
-                .rip = entry_rip,
-                .rbx = 0,
-                .r12 = 0,
-                .r13 = 0,
-                .r14 = 0,
-                .r15 = 0,
-            };
-        }
-    },
-    else => |arch| @compileError("unimplemented architecture: " ++ @tagName(arch)),
-};
-const CallingConvention = std.builtin.CallingConvention;
-
-fn contextSwitch(old_ctx: *Context, new_ctx: *const Context) callconv(switch (builtin.cpu.arch) {
-    .x86_64 => .{ .x86_64_sysv = .{} },
-    else => |arch| @compileError("unimplemented architecture: " ++ @tagName(arch)),
-}) void {
-    switch (builtin.cpu.arch) {
-        .x86_64 => asm volatile (
-        // Save current context
-            \\ movq %%rsp, 0(%%rax)
-            \\ movq %%rbp, 8(%%rax)
-            \\ movq $ret, 16(%%rax)
-            \\ movq %%rbx, 24(%%rax)
-            \\ movq %%r12, 32(%%rax)
-            \\ movq %%r13, 40(%%rax)
-            \\ movq %%r14, 48(%%rax)
-            \\ movq %%r15, 56(%%rax)
-
-            // Restore new context
-            \\ movq 0(%%rcx), %%rsp
-            \\ movq 8(%%rcx), %%rbp
-            \\ movq 24(%%rcx), %%rbx
-            \\ movq 32(%%rcx), %%r12
-            \\ movq 40(%%rcx), %%r13
-            \\ movq 48(%%rcx), %%r14
-            \\ movq 56(%%rcx), %%r15
-            \\ jmpq *16(%%rcx) // jump to RIP
-            \\ ret:
-            :
-            : [old] "{rax}" (old_ctx),
-              [new] "{rcx}" (new_ctx),
-            : "rax", "rcx", "rdx", "rsi", "rdi", "r8", "r9", "r10", "r11", "memory"
-        ),
-        else => |arch| @compileError("unimplemented architecture: " ++ @tagName(arch)),
-    }
-}
-
-/// A single fiber, with its own stack and saved context.
-const Fiber = struct {
-    ctx: Context,
-    stack: []usize,
-    entry: *const fn (arg: *anyopaque) void,
-    arg: *anyopaque,
-
-    // A fiber forms a circular queue
-    next_fiber: *Fiber,
-    prev_fiber: *Fiber,
-
-    /// Initialize a Fiber: alloc a stack, set up a context that will
-    pub fn init(
-        allocator: std.mem.Allocator,
-        stack_size: usize,
-        entry: *const fn (*anyopaque) void,
-        arg: *anyopaque,
-    ) !*Fiber {
-        const stack = try allocator.alloc(usize, @divExact(stack_size, @sizeOf(usize)));
-        var f = try allocator.create(Fiber);
-        f.stack = stack;
-        f.entry = entry;
-        f.arg = arg;
-
-        const top = @intFromPtr(stack.ptr) + stack.len * @sizeOf(usize);
-        f.ctx = .init(@intFromPtr(&fiberTrampoline), top);
-
-        f.next_fiber = f;
-        f.prev_fiber = f;
-        return f;
-    }
-
-    pub fn block(fiber: *Fiber) void {
-        // Remove ourselves from the running queue
-        const t = Thread.current();
-
-        const new_head = fiber.remove();
-
-        // only update the head if we are currently running
-        if (t.running_queue == fiber) {
-            t.running_queue = new_head;
-        }
-
-        t.yeild(&fiber.ctx);
-        std.log.debug("finished block", .{});
-    }
-
-    pub fn wake(fiber: *Fiber) void {
-        // Remove ourselves from the blocking queue
-        const t = Thread.current();
-
-        std.log.debug("waking up fiber", .{});
-        t.insertFiber(fiber);
-    }
-
-    pub fn current() ?*Fiber {
-        return Thread.current().running_queue;
-    }
-
-    // Reuse a fiber, set a new entry point and create a new context.
-    pub fn recycle(fiber: *Fiber, entry: *const fn (*anyopaque) void, arg: *anyopaque) void {
-        fiber.entry = entry;
-        fiber.arg = arg;
-
-        const stack = fiber.buf;
-        const top = @intFromPtr(stack[stack.len..].ptr);
-        fiber.ctx.* = .init(@intFromPtr(fiberTrampoline), top);
-        fiber.next_fiber = fiber;
-        fiber.prev_fiber = fiber;
-    }
-
-    /// Insert `new_fiber` *after* `self` in the circular doubly-linked list.
-    pub fn insert(self: *Fiber, new_fiber: *Fiber) void {
-        const next = self.next_fiber;
-
-        new_fiber.prev_fiber = self;
-        new_fiber.next_fiber = next;
-
-        next.prev_fiber = new_fiber;
-        self.next_fiber = new_fiber;
-
-        std.log.info("added fiber", .{});
-        self.print();
-    }
-
-    pub fn insertBefore(self: *Fiber, new_fiber: *Fiber) void {
-        const prev = self.prev_fiber;
-
-        new_fiber.next_fiber = self;
-        new_fiber.prev_fiber = prev;
-
-        prev.next_fiber = new_fiber;
-        self.prev_fiber = new_fiber;
-
-        std.log.info("added fiber before current", .{});
-        self.print();
-    }
-
-    /// Remove `self` from its circular list.
-    /// If `self` was the only node, returns null.
-    /// Otherwise returns the new head (the next fiber after `self`).
-    pub fn remove(self: *Fiber) ?*Fiber {
-        if (self.next_fiber == self) {
-            return null;
-        }
-
-        self.prev_fiber.next_fiber = self.next_fiber;
-        self.next_fiber.prev_fiber = self.prev_fiber;
-
-        std.log.info("removed fiber", .{});
-        self.next_fiber.print();
-        return self.next_fiber;
-    }
-
-    fn print(self: *Fiber) void {
-        var cur = self;
-        while (true) {
-            std.log.info("fiber: rip=0x{x}, rsp=0x{x}", .{ cur.ctx.rip, cur.ctx.rsp });
-            cur = cur.next_fiber;
-
-            if (cur == self)
-                break;
-        }
-    }
+    pub const Handle = std.posix.fd_t;
 };
 
-fn fiberTrampoline() callconv(.C) void {
-    const t = Thread.current();
-    const fib = t.running_queue.?;
-    fib.entry(fib.arg);
-
-    std.log.info("finished fiber", .{});
-    // Remove us from the running queue
-    t.running_queue = fib.remove();
-
-    if (t.running_queue) |running_queue| {
-        running_queue.print();
-    }
-
-    contextSwitch(&fib.ctx, t.currentContext());
-}
-
-// For now a thread is basiclly a detached fiber, later on we can make it steal work from other threads
-const Thread = struct {
-    thread: std.Thread,
-    el: *EventLoop,
-    running_queue: ?*Fiber,
-
-    idle_context: Context,
-
-    threadlocal var self: *Thread = undefined;
-
-    fn current() *Thread {
-        return self;
-    }
-
-    fn insertFiber(t: *Thread, fib: *Fiber) void {
-        if (t.running_queue) |running_queue| {
-            running_queue.insert(fib);
-        } else {
-            t.running_queue = fib;
-        }
-    }
-
-    fn currentContext(t: *Thread) *Context {
-        if (t.running_queue) |fib| {
-            return &fib.ctx;
-        } else {
-            std.log.info("idle thread", .{});
-            return &t.idle_context;
-        }
-    }
-
-    // Allows the next fiber to run
-    fn yeild(t: *Thread, old_ctx: *Context) void {
-        if (t.running_queue) |fiber| {
-            const new_ctx = &fiber.next_fiber.ctx;
-
-            t.running_queue = fiber.next_fiber;
-
-            contextSwitch(old_ctx, new_ctx);
-
-            std.log.info("end", .{});
-        } else {
-            // No tasks to run, we go to idle loop
-            const new_ctx = &t.idle_context;
-            contextSwitch(old_ctx, new_ctx);
-        }
-    }
-
-    fn entry(t: *Thread) void {
-        self = t;
-        const el = t.el;
-
-        while (t.running_queue) |fiber| {
-            const old_ctx = &self.idle_context;
-            const new_ctx = &fiber.ctx;
-
-            contextSwitch(old_ctx, new_ctx);
-
-            el.io.onPark(el.io.ctx, wakeFut);
-        }
-    }
+// File operation structures for async operations
+const FileOperation = struct {
+    waker: *anyopaque,
+    completed: bool = false,
+    result: union(enum) {
+        success: usize, // bytes read/written
+        err: std.posix.WriteError,
+    } = .{ .success = 0 },
 };
 
-fn wakeFut(fut: *Exec.AnyFuture) void {
-    const task: *AsyncTask = @alignCast(@ptrCast(fut));
-
-    task.fiber.wake();
-}
-
-const AsyncTask = struct {
-    fiber: *Fiber,
-    start: *const fn (context: *const anyopaque, result: *anyopaque) void,
-    result_slice: []u8,
-    context_buf: []u8,
-    waiter: ?*Fiber,
-
-    finished: bool = false,
-
-    fn call(arg: *anyopaque) void {
-        const task: *AsyncTask = @alignCast(@ptrCast(arg));
-        task.start(@ptrCast(task.context_buf.ptr), @ptrCast(task.result_slice.ptr));
-
-        if (task.waiter) |w| {
-            w.wake();
-        }
-        task.waiter = null;
-        task.finished = true;
-
-        std.log.info("finished task", .{});
-    }
+const ReadOperation = struct {
+    base: FileOperation,
+    fd: std.posix.fd_t,
+    buffer: []u8,
+    offset: u64,
 };
 
-/// —————————————————————————————————————————————————————————————————————
-/// async: spawn a fiber on the main thread
-/// —————————————————————————————————————————————————————————————————————
-fn asyncImpl(
-    ctx: ?*anyopaque,
-    result: []u8,
-    ra: std.mem.Alignment,
-    context: []const u8,
-    ca: std.mem.Alignment,
-    start: *const fn (context: *const anyopaque, result: *anyopaque) void,
-) ?*Exec.AnyFuture {
-    const el: *EventLoop = @alignCast(@ptrCast(ctx.?));
+const WriteOperation = struct {
+    base: FileOperation,
+    fd: std.posix.fd_t,
+    buffer: []const u8,
+    offset: u64,
+};
 
-    var task = el.allocator.create(EventLoop.AsyncTask) catch unreachable;
-
-    task.result_slice = if (result.len == 0)
-        &[_]u8{}
-    else
-        (el.allocator.rawAlloc(result.len, ra, 0) orelse unreachable)[0..result.len];
-
-    task.context_buf = if (context.len == 0)
-        &[_]u8{}
-    else
-        (el.allocator.rawAlloc(context.len, ca, 0) orelse unreachable)[0..context.len];
-
-    @memcpy(task.context_buf, context);
-
-    task.waiter = null;
-    task.start = start;
-
-    task.fiber = Fiber.init(el.allocator, 1024 * 1024, AsyncTask.call, @ptrCast(task)) catch unreachable;
-    task.finished = false;
-
-    const t = Thread.current();
-    t.insertFiber(task.fiber);
-
-    return @ptrCast(task);
-}
-
-/// —————————————————————————————————————————————————————————————————————
-/// await: park current fiber until its task completes
-/// —————————————————————————————————————————————————————————————————————
-fn awaitImpl(
-    ctx: ?*anyopaque,
-    any_future: *Exec.AnyFuture,
-    result: []u8,
-    ra: std.mem.Alignment,
-) void {
-    _ = ra;
-    const ev: *EventLoop = @alignCast(@ptrCast(ctx.?));
-    const task: *AsyncTask = @alignCast(@ptrCast(any_future));
+// Open file asynchronously
+pub fn openFile(exec: Exec, path: []const u8, flags: std.posix.O, mode: std.posix.mode_t) !File {
+    // For file opening, we can do it synchronously since it's usually fast
+    // In a real implementation, you might want to use io_uring's IORING_OP_OPENAT
+    const fd = try std.posix.open(path, flags, mode);
     
-    // If task hasnt finished yet, we block until its done
-    if (!task.finished){
-        const me = Fiber.current().?;
-        task.waiter = me;
-        me.block();
+    return File{
+        .handle = fd,
+        .waker = exec.getWaker(),
+    };
+}
+
+// Async file read
+pub fn readFile(exec: Exec, file: File, buffer: []u8, offset: u64) !usize {
+    const thread_ctx: *ThreadContext = @alignCast(@ptrCast(exec.getLocalContext()));
+    
+    // Create read operation
+    const read_op: ReadOperation = .{
+        .base = FileOperation{
+            .waker = file.waker,
+        },
+        .fd = file.handle,
+        .buffer = buffer,
+        .offset = offset,
+    };
+    
+    // Submit read operation to io_uring
+    const sqe = try thread_ctx.io_uring.get_sqe();
+    sqe.prep_read(file.handle, buffer, offset);
+    sqe.user_data = @intFromPtr(&read_op);
+    
+    _ = try thread_ctx.io_uring.submit();
+    
+    // Suspend until the operation completes
+    exec.@"suspend"();
+    
+    
+    switch (read_op.base.result) {
+        .success => |bytes_read| return bytes_read,
+        .err => |err| return err,
     }
+}
 
+// Async file write
+pub fn writeFile(exec: Exec, file: File, buffer: []const u8, offset: u64) !usize {
+    const thread_ctx: *ThreadContext = @alignCast(@ptrCast(exec.getLocalContext()));
+    
+    var write_op = WriteOperation{
+        .base = FileOperation{
+            .waker = file.waker,
+        },
+        .fd = file.handle,
+        .buffer = buffer,
+        .offset = offset,
+    };
+    
+    // Submit write operation to io_uring
+    const sqe = try thread_ctx.io_uring.get_sqe();
+    sqe.prep_write(file.handle, buffer, offset);
+    sqe.user_data = @intFromPtr(&write_op);
+    
+    
+    // Suspend until the operation completes
+    exec.@"suspend"();
+    
+    
+    switch (write_op.base.result) {
+        .success => |bytes_written| return bytes_written,
+        .err => |err| return err,
+    }
+}
 
-    // when resumed, result has been written in-place:
-    @memcpy(result, task.result_slice);
+// Close file
+pub fn closeFile(file: File) void {
+    std.posix.close(file.handle);
+}
 
-    // Only now can we free the fiber.
-    ev.free_fibers.mutex.lock();
-    {
-        if (ev.free_fibers.list) |free_fibers| {
-            free_fibers.insert(task.fiber);
+pub fn io(el: *EventLoop) Exec.Io{
+    return .{
+        .ctx = el,
+        .onPark = &onPark,
+        .createContext = createContext,
+    };
+}
+
+fn onPark(global_ctx: ?*anyopaque, exec: Exec) void{
+    const event_loop: *EventLoop = @alignCast(@ptrCast(global_ctx));
+    const thread_ctx: *ThreadContext = @alignCast(@ptrCast(exec.getLocalContext()));
+    _ = event_loop;
+    
+    log.info("parked", .{});
+
+    const io_uring = &thread_ctx.io_uring;
+    
+    // Wait for completion events
+    var cqes: [io_uring_entries]std.os.linux.io_uring_cqe = undefined;
+    const completed = io_uring.copy_cqes(&cqes, 1) catch {
+        log.err("Failed to get completion events", .{});
+        return;
+    };
+    
+    // Process completed operations
+    for (cqes[0..completed]) |cqe| {
+        const user_data = cqe.user_data;
+        if (user_data == 0) continue;
+        
+        // Cast back to our operation struct
+        const base_op: *FileOperation = @ptrFromInt(user_data);
+        
+        // Set the result based on the completion event
+        if (cqe.res >= 0) {
+            base_op.result = .{ .success = @intCast(cqe.res) };
         } else {
-            ev.free_fibers.list = task.fiber;
+            const errno = @as(std.posix.E, @enumFromInt(-cqe.res));
+            base_op.result = .{ .err = std.posix.unexpectedErrno(errno) };
         }
+        
+        base_op.completed = true;
+        
+        // Wake up the suspended future
+        exec.wake(base_op.waker);
     }
-    ev.free_fibers.mutex.unlock();
-
-    ev.allocator.destroy(task);
 }
 
-const DetachedTask = struct {
-    fiber: *Fiber,
-    start: *const fn (context: *const anyopaque) void,
-    context_buf: []u8,
+// Utility functions for common file operations
 
-    fn call(arg: *anyopaque) void {
-        const task: *DetachedTask = @alignCast(@ptrCast(arg));
-
-        task.start(@ptrCast(task.context_buf.ptr));
-
-        task.fiber.block();
+// Read entire file into allocated buffer
+pub fn readFileAlloc(exec: Exec, allocator: Allocator, path: []const u8) ![]u8 {
+    const file = try openFile(exec, path, .{}, 0);
+    defer closeFile(file);
+    
+    // Get file size
+    const stat = try std.posix.fstat(file.handle);
+    const file_size = @as(usize, @intCast(stat.size));
+    
+    // Allocate buffer
+    const buffer = try allocator.alloc(u8, file_size);
+    errdefer allocator.free(buffer);
+    
+    // Read the entire file
+    const bytes_read = try readFile(exec, file, buffer, 0);
+    
+    if (bytes_read != file_size) {
+        allocator.free(buffer);
+        return error.IncompleteRead;
     }
-};
-
-/// —————————————————————————————————————————————————————————————————————
-/// asyncDetached: fire‑and‑forget on a real thread
-/// —————————————————————————————————————————————————————————————————————
-fn asyncDetachedImpl(
-    ctx: ?*anyopaque,
-    context: []const u8,
-    ca: std.mem.Alignment,
-    start: *const fn (context: *const anyopaque) void,
-) void {
-    const el: *EventLoop = @alignCast(@ptrCast(ctx));
-
-    var t = el.allocator.create(DetachedTask) catch unreachable;
-
-    if (context.len == 0) {
-        t.context_buf = &[_]u8{};
-    } else {
-        t.context_buf = (el.allocator.rawAlloc(context.len, ca, @returnAddress()) orelse unreachable)[0..context.len];
-    }
-    @memcpy(t.context_buf, context);
-
-    t.start = start;
-
-    t.fiber = Fiber.init(el.allocator, 1024 * 1024, DetachedTask.call, @ptrCast(t)) catch unreachable;
-
-    const thread: *Thread = el.allocator.create(Thread) catch unreachable;
-
-    thread.el = el;
-    thread.running_queue = t.fiber;
-    thread.idle_context = .{};
-
-    thread.thread = std.Thread.spawn(.{ .allocator = el.allocator }, Thread.entry, .{thread}) catch unreachable;
+    
+    return buffer;
 }
 
-/// —————————————————————————————————————————————————————————————————————
-/// suspend: simply set ourselves to blocking, we wont unblock until we get woken up
-/// —————————————————————————————————————————————————————————————————————
-fn suspendImpl(ctx: ?*anyopaque) void {
-    _ = ctx;
-    const me = Fiber.current().?;
-    me.block();
-}
-
-/// —————————————————————————————————————————————————————————————————————
-/// select: wait on multiple futures
-/// —————————————————————————————————————————————————————————————————————
-fn selectImpl(
-    ctx: ?*anyopaque,
-    futures: []const *Exec.AnyFuture,
-) usize {
-    _ = ctx;
-    const me = Fiber.current().?;
-
-    var i: usize = 0;
-    for (futures) |afut| {
-        const t: *AsyncTask = @alignCast(@ptrCast(afut));
-        t.waiter = me;
-        i += 1;
+// Write entire buffer to file
+pub fn writeFileAll(exec: Exec, path: []const u8, data: []const u8) !void {
+    const file = try openFile(exec, path, .{ .WRONLY = true, .CREAT = true, .TRUNC = true }, 0o644);
+    defer closeFile(file);
+    
+    var offset: u64 = 0;
+    var remaining = data;
+    
+    while (remaining.len > 0) {
+        const bytes_written = try writeFile(exec, file, remaining, offset);
+        offset += bytes_written;
+        remaining = remaining[bytes_written..];
     }
-    me.block();
-
-    i = 0;
-    // find the one that completed
-    for (futures) |afut| {
-        const t: *AsyncTask = @alignCast(@ptrCast(afut));
-
-        if (t.finished) {
-            return i;
-        }
-        i += 1;
-    }
-    unreachable;
 }
