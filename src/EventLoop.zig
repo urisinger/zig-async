@@ -1,6 +1,6 @@
 const std = @import("std");
-const Exec = @import("Exec.zig");
-const Io = Exec.Io;
+const Runtime = @import("Runtime.zig");
+const Io = Runtime.Io;
 
 const log = std.log.scoped(.EventLoop);
 
@@ -51,7 +51,7 @@ const vtable: Io.VTable = .{
     .pwrite = pwrite,
 };
 
-pub fn io(el: *EventLoop) Exec.Io {
+pub fn io(el: *EventLoop) Runtime.Io {
     return .{
         .ctx = el,
         .vtable = &vtable,
@@ -59,7 +59,7 @@ pub fn io(el: *EventLoop) Exec.Io {
 }
 
 // Open file asynchronously
-pub fn openFile(ctx: ?*anyopaque, exec: Exec, path: []const u8, flags: Io.File.OpenFlags) Io.File.OpenError!Io.File {
+pub fn openFile(ctx: ?*anyopaque, rt: Runtime, path: []const u8, flags: Io.File.OpenFlags) Io.File.OpenError!Io.File {
     _ = ctx;
     var os_flags: std.posix.O = .{
         .ACCMODE = switch (flags.mode) {
@@ -77,18 +77,18 @@ pub fn openFile(ctx: ?*anyopaque, exec: Exec, path: []const u8, flags: Io.File.O
 
     return .{
         .handle = fd,
-        .exec = exec,
+        .runtime = rt,
     };
 }
 
 // Async file read
-pub fn pread(ctx: ?*anyopaque, exec: Exec, file: Io.File, buffer: []u8, offset: std.posix.off_t) Io.File.PReadError!usize {
+pub fn pread(ctx: ?*anyopaque, rt: Runtime, file: Io.File, buffer: []u8, offset: std.posix.off_t) Io.File.PReadError!usize {
     _ = ctx;
-    const thread_ctx: *ThreadContext = @alignCast(@ptrCast(exec.getLocalContext()));
+    const thread_ctx: *ThreadContext = @alignCast(@ptrCast(rt.getLocalContext()));
 
     // Create read operation
     const read_op: Operation = .{
-        .waker = exec.getWaker(),
+        .waker = rt.getWaker(),
         .result = 0,
     };
 
@@ -99,7 +99,7 @@ pub fn pread(ctx: ?*anyopaque, exec: Exec, file: Io.File, buffer: []u8, offset: 
     sqe.prep_read(file.handle, buffer, @bitCast(offset));
     sqe.user_data = @intFromPtr(&read_op);
 
-    exec.@"suspend"();
+    rt.@"suspend"();
 
     switch (errno(read_op.result)) {
         .SUCCESS => return @as(u32, @bitCast(read_op.result)),
@@ -115,12 +115,12 @@ pub fn pread(ctx: ?*anyopaque, exec: Exec, file: Io.File, buffer: []u8, offset: 
 }
 
 // Async file write
-pub fn pwrite(ctx: ?*anyopaque, exec: Exec, file: Io.File, buffer: []const u8, offset: std.posix.off_t) Io.File.PWriteError!usize {
+pub fn pwrite(ctx: ?*anyopaque, rt: Runtime, file: Io.File, buffer: []const u8, offset: std.posix.off_t) Io.File.PWriteError!usize {
     _ = ctx;
-    const thread_ctx: *ThreadContext = @alignCast(@ptrCast(exec.getLocalContext()));
+    const thread_ctx: *ThreadContext = @alignCast(@ptrCast(rt.getLocalContext()));
 
     var write_op: Operation = .{
-        .waker = exec.getWaker(),
+        .waker = rt.getWaker(),
         .result = 0,
     };
 
@@ -132,7 +132,7 @@ pub fn pwrite(ctx: ?*anyopaque, exec: Exec, file: Io.File, buffer: []const u8, o
     sqe.user_data = @intFromPtr(&write_op);
 
     // Suspend until the operation completes
-    exec.@"suspend"();
+    rt.@"suspend"();
 
     switch (errno(write_op.result)) {
         .SUCCESS => return @as(u32, @bitCast(write_op.result)),
@@ -156,15 +156,15 @@ pub fn pwrite(ctx: ?*anyopaque, exec: Exec, file: Io.File, buffer: []const u8, o
 }
 
 // Close file
-pub fn closeFile(ctx: ?*anyopaque, exec: Exec, file: Io.File) void {
+pub fn closeFile(ctx: ?*anyopaque, rt: Runtime, file: Io.File) void {
     _ = ctx;
-    _ = exec;
+    _ = rt;
     std.posix.close(file.handle);
 }
 
-fn onPark(global_ctx: ?*anyopaque, exec: Exec) void {
+fn onPark(global_ctx: ?*anyopaque, rt: Runtime) void {
     const event_loop: *EventLoop = @alignCast(@ptrCast(global_ctx));
-    const thread_ctx: *ThreadContext = @alignCast(@ptrCast(exec.getLocalContext()));
+    const thread_ctx: *ThreadContext = @alignCast(@ptrCast(rt.getLocalContext()));
 
     log.info("parked", .{});
 
@@ -199,7 +199,7 @@ fn onPark(global_ctx: ?*anyopaque, exec: Exec) void {
         base_op.result = cqe.res;
 
         // Wake up the suspended future
-        exec.wake(base_op.waker);
+        rt.wake(base_op.waker);
     }
 }
 

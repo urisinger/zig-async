@@ -1,6 +1,6 @@
 const std = @import("std");
 const log = std.log.scoped(.main);
-const Exec = @import("Exec.zig");
+const Runtime = @import("Runtime.zig");
 const Fibers = @import("Fibers.zig");
 const EventLoop = @import("EventLoop.zig");
 
@@ -10,15 +10,15 @@ pub fn main() !void {
     const allocator = gpa.allocator();
 
     var event_loop = EventLoop.init(gpa.allocator());
-    var runtime = Fibers.init(allocator, event_loop.io());
+    var fibers = Fibers.init(allocator, event_loop.io());
 
-    const exec = runtime.exec();
+    const rt = fibers.runtime();
 
-    exec.asyncDetached(run, .{exec});
+    rt.asyncDetached(run, .{rt});
 
-    runtime.join();
+    fibers.join();
 
-    runtime.deinit();
+    fibers.deinit();
 
     const check = gpa.deinit();
     if (check == .leak) {
@@ -26,36 +26,36 @@ pub fn main() !void {
     }
 }
 
-pub fn run(exec: Exec) void {
-    var fut1 = exec.@"async"(run1, .{exec});
-    var fut2 = exec.@"async"(run2, .{exec});
-    var fut3 = exec.@"async"(run3, .{exec});
+pub fn run(rt: Runtime) void {
+    var fut1 = rt.@"async"(run1, .{rt});
+    var fut3 = rt.@"async"(run3, .{rt});
+    var fut2 = rt.@"async"(run2, .{rt});
 
-    _ = fut3.@"await"(exec);
-    _ = fut1.@"await"(exec);
-    _ = fut2.@"await"(exec);
+    _ = fut3.@"await"(rt);
+    _ = fut1.@"await"(rt);
+    _ = fut2.@"await"(rt);
 
     log.info("main finished", .{});
 }
 
-pub fn run1(exec: Exec) i32 {
-    _ = exec;
+pub fn run1(rt: Runtime) i32 {
+    _ = rt;
     log.info("future 1 running", .{});
 
     return 1;
 }
 
-pub fn run2(exec: Exec) i32 {
-    _ = exec;
+pub fn run2(rt: Runtime) i32 {
+    _ = rt;
     log.info("future 2 running", .{});
 
     return 2;
 }
 
-pub fn run3(exec: Exec) usize {
+pub fn run3(rt: Runtime) usize {
     log.info("future 3 running", .{});
 
-    const file = exec.open("/dev/random", .{ .mode = .read_only }) catch unreachable;
+    const file = rt.open("/dev/random", .{ .mode = .read_only }) catch unreachable;
     var res: [10]u8 = undefined;
     @memset(&res, 1);
     const read = file.read(

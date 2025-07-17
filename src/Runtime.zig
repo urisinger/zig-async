@@ -1,25 +1,25 @@
 const std = @import("std");
 const fs = std.fs;
 
-const Exec = @This();
+const Runtime = @This();
 
 const FileHandle = opaque {};
 
 pub const Io = struct {
     pub const VTable = struct {
         createContext: *const fn (global_ctx: ?*anyopaque) ?*anyopaque,
-        onPark: *const fn (global_ctx: ?*anyopaque, exec: Exec) void,
+        onPark: *const fn (global_ctx: ?*anyopaque, runtime: Runtime) void,
 
-        //createFile: *const fn (global_ctx: ?*anyopaque, exec: Exec, path: []const u8, flags: File.CreateFlags) File.OpenError!File,
-        openFile: *const fn (global_ctx: ?*anyopaque, exec: Exec, path: []const u8, flags: File.OpenFlags) File.OpenError!File,
-        closeFile: *const fn (global_ctx: ?*anyopaque, exec: Exec, File) void,
-        pread: *const fn (global_ctx: ?*anyopaque, exec: Exec, file: File, buffer: []u8, offset: std.posix.off_t) File.PReadError!usize,
-        pwrite: *const fn (global_ctx: ?*anyopaque, exec: Exec, file: File, buffer: []const u8, offset: std.posix.off_t) File.PWriteError!usize,
+        //createFile: *const fn (global_ctx: ?*anyopaque, runtime: runtime, path: []const u8, flags: File.CreateFlags) File.OpenError!File,
+        openFile: *const fn (global_ctx: ?*anyopaque, runtime: Runtime, path: []const u8, flags: File.OpenFlags) File.OpenError!File,
+        closeFile: *const fn (global_ctx: ?*anyopaque, runtime: Runtime, File) void,
+        pread: *const fn (global_ctx: ?*anyopaque, runtime: Runtime, file: File, buffer: []u8, offset: std.posix.off_t) File.PReadError!usize,
+        pwrite: *const fn (global_ctx: ?*anyopaque, runtime: Runtime, file: File, buffer: []const u8, offset: std.posix.off_t) File.PWriteError!usize,
     };
 
     pub const File = struct {
         handle: Handle,
-        exec: Exec,
+        runtime: Runtime,
 
         pub const Handle = std.posix.fd_t;
 
@@ -29,7 +29,7 @@ pub const Io = struct {
         pub const OpenError = fs.File.OpenError;
 
         pub fn close(file: File) void {
-            return file.exec.io.vtable.closeFile(file.exec.io.ctx, file.exec, file);
+            return file.runtime.io.vtable.closeFile(file.runtime.io.ctx, file.runtime, file);
         }
 
         pub const ReadError = fs.File.ReadError;
@@ -41,7 +41,7 @@ pub const Io = struct {
         pub const PReadError = fs.File.PReadError;
 
         pub fn pread(file: File, buffer: []u8, offset: std.posix.off_t) PReadError!usize {
-            return file.exec.io.vtable.pread(file.exec.io.ctx, file.exec, file, buffer, offset);
+            return file.runtime.io.vtable.pread(file.runtime.io.ctx, file.runtime, file, buffer, offset);
         }
 
         pub const WriteError = fs.File.WriteError;
@@ -53,7 +53,7 @@ pub const Io = struct {
         pub const PWriteError = fs.File.PWriteError;
 
         pub fn pwrite(file: File, buffer: []const u8, offset: std.posix.off_t) PWriteError!usize {
-            return file.exec.io.vtable.pwrite(file.exec.io.ctx, file.exec, file, buffer, offset);
+            return file.runtime.io.vtable.pwrite(file.runtime.io.ctx, file.runtime, file, buffer, offset);
         }
 
         pub fn writeAll(file: File, bytes: []const u8) WriteError!void {
@@ -96,12 +96,12 @@ pub const VTable = struct {
         context_alignment: std.mem.Alignment,
         start: *const fn (context: *const anyopaque, result: *anyopaque) void,
     ) ?*AnyFuture,
-    /// Executes `start` asynchronously in a manner such that it cleans itself
+    /// runtimeutes `start` asynchronously in a manner such that it cleans itself
     /// up. This mode does not support results, await, or cancel.
     ///
     /// Thread-safe.
     asyncDetached: *const fn (
-        /// Corresponds to `Exec.ctx`.
+        /// Corresponds to `runtime.ctx`.
         ctx: ?*anyopaque,
         /// Copied and then passed to `start`.
         context: []const u8,
@@ -137,20 +137,20 @@ pub const VTable = struct {
     getLocalContext: *const fn (ctx: ?*anyopaque) ?*anyopaque,
 };
 
-pub fn @"suspend"(exec: Exec) void {
-    exec.vtable.@"suspend"(exec.ctx);
+pub fn @"suspend"(runtime: Runtime) void {
+    runtime.vtable.@"suspend"(runtime.ctx);
 }
 
-pub fn wake(exec: Exec, fut: *anyopaque) void {
-    exec.vtable.wake(exec.ctx, fut);
+pub fn wake(runtime: Runtime, fut: *anyopaque) void {
+    runtime.vtable.wake(runtime.ctx, fut);
 }
 
-pub fn getWaker(exec: Exec) *anyopaque {
-    return exec.vtable.getWaker(exec.ctx);
+pub fn getWaker(runtime: Runtime) *anyopaque {
+    return runtime.vtable.getWaker(runtime.ctx);
 }
 
-pub fn getLocalContext(exec: Exec) ?*anyopaque {
-    return exec.vtable.getLocalContext(exec.ctx);
+pub fn getLocalContext(runtime: Runtime) ?*anyopaque {
+    return runtime.vtable.getLocalContext(runtime.ctx);
 }
 
 pub const AnyFuture = opaque {};
@@ -160,9 +160,9 @@ pub fn Future(Result: type) type {
         any_future: ?*AnyFuture,
         result: Result,
 
-        pub fn @"await"(f: *@This(), exec: Exec) Result {
+        pub fn @"await"(f: *@This(), runtime: Runtime) Result {
             const any_future = f.any_future orelse return f.result;
-            exec.vtable.@"await"(exec.ctx, any_future, if (@sizeOf(Result) == 0) &.{} else @ptrCast((&f.result)[0..1]), std.mem.Alignment.fromByteUnits(@alignOf(Result)));
+            runtime.vtable.@"await"(runtime.ctx, any_future, if (@sizeOf(Result) == 0) &.{} else @ptrCast((&f.result)[0..1]), std.mem.Alignment.fromByteUnits(@alignOf(Result)));
             f.any_future = null;
             return f.result;
         }
@@ -171,7 +171,7 @@ pub fn Future(Result: type) type {
 
 /// Calls `function` with `args` asynchronously. The resource cleans itself up
 /// when the function returns. Does not support await, cancel, or a return value.
-pub inline fn asyncDetached(exec: Exec, function: anytype, args: std.meta.ArgsTuple(@TypeOf(function))) void {
+pub inline fn asyncDetached(runtime: Runtime, function: anytype, args: std.meta.ArgsTuple(@TypeOf(function))) void {
     const Args = @TypeOf(args);
     const TypeErased = struct {
         fn start(context: *const anyopaque) void {
@@ -179,12 +179,12 @@ pub inline fn asyncDetached(exec: Exec, function: anytype, args: std.meta.ArgsTu
             @call(.auto, function, args_casted.*);
         }
     };
-    exec.vtable.asyncDetached(exec.ctx, if (@sizeOf(Args) == 0) &.{} else @ptrCast((&args)[0..1]), std.mem.Alignment.fromByteUnits(@alignOf(Args)), TypeErased.start);
+    runtime.vtable.asyncDetached(runtime.ctx, if (@sizeOf(Args) == 0) &.{} else @ptrCast((&args)[0..1]), std.mem.Alignment.fromByteUnits(@alignOf(Args)), TypeErased.start);
 }
 
 /// Calls `function` with `args`, such that the return value of the function is
 /// not guaranteed to be available until `await` is called.
-pub inline fn @"async"(exec: Exec, function: anytype, args: std.meta.ArgsTuple(@TypeOf(function))) Future(@typeInfo(@TypeOf(function)).@"fn".return_type.?) {
+pub inline fn @"async"(runtime: Runtime, function: anytype, args: std.meta.ArgsTuple(@TypeOf(function))) Future(@typeInfo(@TypeOf(function)).@"fn".return_type.?) {
     const Result = @typeInfo(@TypeOf(function)).@"fn".return_type.?;
     const Args = @TypeOf(args);
     const TypeErased = struct {
@@ -195,8 +195,8 @@ pub inline fn @"async"(exec: Exec, function: anytype, args: std.meta.ArgsTuple(@
         }
     };
     var future: Future(Result) = undefined;
-    future.any_future = exec.vtable.@"async"(
-        exec.ctx,
+    future.any_future = runtime.vtable.@"async"(
+        runtime.ctx,
         if (@sizeOf(Result) == 0) &.{} else @ptrCast((&future.result)[0..1]),
         std.mem.Alignment.fromByteUnits(@alignOf(Result)),
         if (@sizeOf(Args) == 0) &.{} else @ptrCast((&args)[0..1]),
@@ -229,7 +229,7 @@ pub fn SelectUnion(S: type) type {
 
 /// `s` is a struct with every field a `*Future(T)`, where `T` can be any type,
 /// and can be different for each field.
-pub fn select(exec: Exec, s: anytype) SelectUnion(@TypeOf(s)) {
+pub fn select(runtime: Runtime, s: anytype) SelectUnion(@TypeOf(s)) {
     const U = SelectUnion(@TypeOf(s));
     const S = @TypeOf(s);
     const fields = @typeInfo(S).@"struct".fields;
@@ -238,15 +238,15 @@ pub fn select(exec: Exec, s: anytype) SelectUnion(@TypeOf(s)) {
         const future = @field(s, field.name);
         any_future.* = future.any_future orelse return @unionInit(U, field.name, future.result);
     }
-    switch (exec.vtable.select(exec.ctx, &futures)) {
+    switch (runtime.vtable.select(runtime.ctx, &futures)) {
         inline 0...(fields.len - 1) => |selected_index| {
             const field_name = fields[selected_index].name;
-            return @unionInit(U, field_name, @field(s, field_name).@"await"(exec));
+            return @unionInit(U, field_name, @field(s, field_name).@"await"(runtime));
         },
         else => unreachable,
     }
 }
 
-pub fn open(exec: Exec, path: []const u8, flags: Io.File.OpenFlags) !Io.File {
-    return exec.io.vtable.openFile(exec.io.ctx, exec, path, flags);
+pub fn open(runtime: Runtime, path: []const u8, flags: Io.File.OpenFlags) !Io.File {
+    return runtime.io.vtable.openFile(runtime.io.ctx, runtime, path, flags);
 }
