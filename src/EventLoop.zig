@@ -1,6 +1,6 @@
 const std = @import("std");
 const Runtime = @import("Runtime.zig");
-const Io = Runtime.Io;
+const Io = @import("Io.zig");
 
 const log = std.log.scoped(.EventLoop);
 
@@ -51,7 +51,7 @@ const vtable: Io.VTable = .{
     .pwrite = pwrite,
 };
 
-pub fn io(el: *EventLoop) Runtime.Io {
+pub fn io(el: *EventLoop) Io {
     return .{
         .ctx = el,
         .vtable = &vtable,

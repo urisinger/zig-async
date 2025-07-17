@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const Runtime = @import("Runtime.zig");
+const Io = @import("Io.zig");
 
 const log = std.log.scoped(.Fibers);
 const assert = std.debug.assert;
@@ -14,7 +15,7 @@ threads: struct {
     list: []std.Thread,
 },
 
-io: Runtime.Io,
+io: Io,
 const vtable: Runtime.VTable = .{
     .@"async" = @"async",
     .asyncDetached = asyncDetached,
@@ -26,7 +27,7 @@ const vtable: Runtime.VTable = .{
     .getLocalContext = getLocalContext,
 };
 
-pub fn init(allocator: std.mem.Allocator, io: Runtime.Io) Fibers {
+pub fn init(allocator: std.mem.Allocator, io: Io) Fibers {
     return .{
         .allocator = allocator,
 
