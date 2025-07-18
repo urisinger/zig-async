@@ -27,6 +27,7 @@ pub fn createContext(global_ctx: ?*anyopaque) ?*anyopaque {
 
     const thread_ctx = event_loop.allocator.create(ThreadContext) catch unreachable;
     thread_ctx.* = ThreadContext.init(event_loop);
+    _  = thread_ctx.io_uring.submit() catch unreachable;
 
     log.info("Created event loop context", .{});
 
@@ -40,7 +41,10 @@ pub fn init(allocator: Allocator) EventLoop {
 }
 
 // File operation structures for async operations
-const Operation = struct { waker: *anyopaque, result: i32 };
+const Operation = struct {
+    waker: *anyopaque,
+    result: i32,
+};
 
 const vtable: Io.VTable = .{
     .createContext = createContext,
@@ -49,6 +53,7 @@ const vtable: Io.VTable = .{
     .closeFile = closeFile,
     .pread = pread,
     .pwrite = pwrite,
+    .wakeThread = wakeThread,
 };
 
 pub fn io(el: *EventLoop) Io {
@@ -169,20 +174,32 @@ pub fn closeFile(ctx: ?*anyopaque, rt: Runtime, file: Io.File) void {
     std.posix.close(file.handle);
 }
 
+// Magic value to distinguish wake-up messages from regular I/O operations
+// Using a large value that won't conflict with normal I/O lengths
+const WAKE_TASK_MAGIC: u32 = 0xDEADBEEF;
+
+fn wakeThread(global_ctx: ?*anyopaque, rt: Runtime, other_thread_ctx: ?*anyopaque, task: *anyopaque) void {
+    _ = global_ctx;
+    std.log.info("waking thread", .{});
+    const other_thread: *ThreadContext = @alignCast(@ptrCast(other_thread_ctx));
+    const cur_thread: *ThreadContext = @alignCast(@ptrCast(rt.getLocalContext()));
+
+    const sqe = cur_thread.io_uring.get_sqe() catch {
+        @panic("failed to get sqe");
+    };
+
+    sqe.prep_rw(.MSG_RING, other_thread.io_uring.fd, 0, WAKE_TASK_MAGIC, WAKE_TASK_MAGIC);
+    sqe.user_data = @intFromPtr(task);
+}
+
 fn onPark(global_ctx: ?*anyopaque, rt: Runtime) void {
     const event_loop: *EventLoop = @alignCast(@ptrCast(global_ctx));
+    _ = event_loop;
     const thread_ctx: *ThreadContext = @alignCast(@ptrCast(rt.getLocalContext()));
 
     log.info("parked", .{});
 
     const io_uring = &thread_ctx.io_uring;
-
-    // Check if there are any pending submissions
-    const pending_submissions = io_uring.sq_ready();
-    if (pending_submissions == 0) {
-        event_loop.allocator.destroy(thread_ctx);
-        return;
-    }
 
     // Submit pending operations and wait for at least one completion
     _ = thread_ctx.io_uring.submit_and_wait(1) catch unreachable;
@@ -197,9 +214,20 @@ fn onPark(global_ctx: ?*anyopaque, rt: Runtime) void {
     // Process completed operations
     for (cqes[0..completed]) |cqe| {
         const user_data = cqe.user_data;
-        if (user_data == 0) continue;
 
-        // Cast back to our operation struct
+        // If the user data is 0, skip this entry
+        std.log.info("0x{x}, e: {}", .{@as(u32, @bitCast(cqe.res)), errno(cqe.res)});
+
+        // Check if this is a wake-up message by looking at the len field in the result
+        // For wake-up messages, the len field contains our magic value
+        if (@as(u32, @bitCast(cqe.res)) == WAKE_TASK_MAGIC) {
+            // This is a wake-up message, the user_data contains the task pointer
+            const task: *anyopaque = @ptrFromInt(user_data);
+            rt.wake(task);
+            break;
+        }
+
+        // Regular I/O operation completion
         const base_op: *Operation = @ptrFromInt(user_data);
 
         // Set the result based on the completion event

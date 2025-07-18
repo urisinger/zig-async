@@ -16,7 +16,7 @@ pub fn main() !void {
 
     rt.asyncDetached(run, .{rt});
 
-    std.log.info("hi form main", .{});
+    std.log.info("hi form", .{});
     fibers.join();
 
     fibers.deinit();
@@ -24,14 +24,14 @@ pub fn main() !void {
 
 pub fn run(rt: Runtime) void {
     var fut1 = rt.@"async"(run1, .{rt});
-    var fut3 = rt.@"async"(run3, .{rt});
-    _ = fut3.cancel(rt);
-
     log.info("hi", .{});
     var fut2 = rt.@"async"(run2, .{rt});
+    var fut3 = rt.@"async"(run3, .{rt});
 
     _ = fut1.@"await"(rt);
     _ = fut2.@"await"(rt);
+
+    _ = fut3.cancel(rt);
 
     log.info("main finished", .{});
 }

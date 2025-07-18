@@ -10,11 +10,20 @@ const assert = std.debug.assert;
 const Fibers = @This();
 
 allocator: std.mem.Allocator,
-
+// We save this just so we can join
 threads: struct {
     mutex: std.Thread.Mutex,
-    list: []std.Thread,
+    list: std.ArrayList(std.Thread),
 },
+
+// Free threads, we can
+free_threads: struct {
+    mutex: std.Thread.Mutex,
+    list: std.ArrayList(*Thread),
+},
+
+// Signal to all threads to exit
+should_exit: std.atomic.Value(bool),
 
 io: Io,
 const vtable: Runtime.VTable = .{
@@ -35,8 +44,15 @@ pub fn init(allocator: std.mem.Allocator, io: Io) Fibers {
 
         .threads = .{
             .mutex = .{},
-            .list = &[_]std.Thread{},
+            .list = .init(allocator),
         },
+
+        .free_threads = .{
+            .mutex = .{},
+            .list = .init(allocator),
+        },
+
+        .should_exit = std.atomic.Value(bool).init(false),
 
         .io = io,
     };
@@ -44,20 +60,40 @@ pub fn init(allocator: std.mem.Allocator, io: Io) Fibers {
 
 pub fn deinit(self: *Fibers) void {
     self.threads.mutex.lock();
-    self.allocator.free(self.threads.list);
+    self.threads.list.deinit();
     self.threads.mutex.unlock();
+
+    self.free_threads.mutex.lock();
+    self.free_threads.list.deinit();
+    self.free_threads.mutex.unlock();
+}
+
+pub fn shutdown(self: *Fibers) void {
+    // Signal all threads to exit
+    self.should_exit.store(true, .release);
+
+    // Wake up all idle threads by sending them wake signals
+    self.free_threads.mutex.lock();
+    const free_threads = self.free_threads.list.clone() catch unreachable;
+    self.free_threads.mutex.unlock();
+
+
+    free_threads.deinit();
 }
 
 pub fn join(self: *Fibers) void {
+    // First shutdown threads
+    self.shutdown();
+
     self.threads.mutex.lock();
-    const threads_copy = self.allocator.dupe(std.Thread, self.threads.list) catch unreachable;
+    const threads_copy = self.threads.list.clone() catch unreachable;
     self.threads.mutex.unlock();
 
-    for (threads_copy) |thread| {
+    for (threads_copy.items) |thread| {
         thread.join();
     }
 
-    self.allocator.free(threads_copy);
+    threads_copy.deinit();
 }
 
 pub fn runtime(self: *Fibers) Runtime {
@@ -110,6 +146,28 @@ fn contextSwitch(old_ctx: *Context, new_ctx: *const Context) callconv(switch (bu
     }
 }
 
+fn schedule(rt: *Fibers, fiber: *Fiber) void {
+    rt.free_threads.mutex.lock();
+    const maybe_thread: ?*Thread = rt.free_threads.list.pop();
+    rt.free_threads.mutex.unlock();
+
+    if (maybe_thread) |thread| {
+        fiber.thread = thread;
+        rt.io.vtable.wakeThread(rt.io.ctx, rt.runtime(), @ptrCast(thread), @ptrCast(fiber));
+    } else {
+        const thread = std.Thread.spawn(.{}, Thread.entry, .{ rt, fiber }) catch |err| {
+            std.log.err("failed to spawn thread: {s}", .{@errorName(err)});
+            unreachable;
+        };
+        rt.threads.mutex.lock();
+        rt.threads.list.append(thread) catch |err| {
+            std.log.err("failed to append thread to thread list: {s}", .{@errorName(err)});
+            unreachable;
+        };
+        rt.threads.mutex.unlock();
+    }
+}
+
 /// A single fiber, with its own stack and saved context.
 const Fiber = struct {
     ctx: Context,
@@ -117,12 +175,15 @@ const Fiber = struct {
     entry: *const fn (arg: *anyopaque) void,
     arg: *anyopaque,
 
+    thread: ?*Thread,
+
     // A fiber forms a circular queue
     next_fiber: *Fiber,
     prev_fiber: *Fiber,
 
+    // Use atomics for these, shared across threads
     state: State = .running,
-
+    // Use atomics for these, shared across threads
     canceled: bool = false,
 
     const State = enum {
@@ -152,9 +213,18 @@ const Fiber = struct {
         self.prev_fiber = self;
     }
 
+    pub fn cancel(self: *Fiber) void {
+        @atomicStore(bool, &self.canceled, true, .monotonic);
+    }
+
+    pub fn isCanceled(self: *Fiber) bool {
+        return @atomicLoad(bool, &self.canceled, .monotonic);
+    }
+
     fn trampoline() callconv(.C) void {
         const t = Thread.current();
         const fib = t.running_queue.?;
+        std.log.info("running fiber", .{});
         fib.entry(fib.arg);
 
         // Remove us from the running queue
@@ -169,28 +239,25 @@ const Fiber = struct {
 
     pub fn block(fiber: *Fiber) void {
         // Remove ourselves from the running queue
-        const t = Thread.current();
-
         const new_head = fiber.remove();
 
         // only update the head if we are currently running
-        if (t.running_queue == fiber) {
-            t.running_queue = new_head;
+        if (fiber.thread.?.running_queue == fiber) {
+            fiber.thread.?.running_queue = new_head;
         }
 
         fiber.state = .waiting;
 
-        t.yeild(&fiber.ctx);
+        fiber.thread.?.yeild(&fiber.ctx);
     }
 
     pub fn wake(fiber: *Fiber) void {
-        // Remove ourselves from the blocking queue
-        const t = Thread.current();
-
-        if (fiber.state == .waiting) {
-            t.insertFiber(fiber);
-            fiber.state = .running;
-        }
+        fiber.thread.?.rt.io.vtable.wakeThread(
+            fiber.thread.?.rt.io.ctx,
+            fiber.thread.?.rt.runtime(),
+            @ptrCast(fiber.thread.?),
+            @ptrCast(fiber),
+        );
     }
 
     pub fn current() ?*Fiber {
@@ -231,25 +298,12 @@ const Fiber = struct {
 
         return self.next_fiber;
     }
-
-    pub fn printQueue(self: *Fiber) void {
-        var cur = self;
-        while (cur.next_fiber != self) {
-            cur.print();
-            cur = cur.next_fiber;
-        }
-
-        cur.print();
-    }
-
-    pub fn print(self: *Fiber) void {
-        log.info("Fiber: {x}", .{@intFromPtr(self)});
-    }
 };
 
 // For now a thread is basiclly a detached fiber, later on we can make it steal work from other threads
 const Thread = struct {
     rt: *Fibers,
+
     running_queue: ?*Fiber,
 
     idle_context: Context,
@@ -295,37 +349,49 @@ const Thread = struct {
         }
     }
 
-    fn entry(rt: *Fibers, context_buf: []u8, ca: std.mem.Alignment, start: *const fn (context: *const anyopaque) void) void {
-        var main_fiber: Fiber = undefined;
-        main_fiber.init(rt.allocator, 1024 * 1024, start, @ptrCast(context_buf.ptr)) catch unreachable;
-
+    fn entry(rt: *Fibers, main_fiber: *Fiber) void {
         var t: Thread = .{
             .rt = rt,
-            .running_queue = &main_fiber,
+            .running_queue = main_fiber,
             .idle_context = .{},
             .io_ctx = rt.io.vtable.createContext(rt.io.ctx),
         };
+        main_fiber.thread = &t;
         self = &t;
 
         while (t.running_queue) |fiber| {
             const old_ctx = &self.idle_context;
             const new_ctx = &fiber.ctx;
 
+            std.log.info("switching to fiber", .{});
+
             contextSwitch(old_ctx, new_ctx);
 
+            rt.free_threads.mutex.lock();
+            rt.free_threads.list.append(&t) catch |err| {
+                std.log.err("failed to append thread to free list: {s}", .{@errorName(err)});
+                unreachable;
+            };
+            rt.free_threads.mutex.unlock();
+            
             rt.io.vtable.onPark(rt.io.ctx, rt.runtime());
         }
 
-        rt.allocator.rawFree(context_buf, ca, @returnAddress());
-        main_fiber.deinit(rt.allocator);
+        //rt.allocator.rawFree(context_buf, ca, @returnAddress());
     }
 };
 
+// May only wake on the current thread
 fn wake(ctx: ?*anyopaque, waker: *anyopaque) void {
     _ = ctx;
     const fiber: *Fiber = @alignCast(@ptrCast(waker));
 
-    fiber.wake();
+    std.log.info("waking fiber", .{});
+
+    if (fiber.state == .waiting) {
+        fiber.thread.?.insertFiber(fiber);
+        fiber.state = .running;
+    }
 }
 
 fn getWaker(ctx: ?*anyopaque) *anyopaque {
@@ -335,7 +401,6 @@ fn getWaker(ctx: ?*anyopaque) *anyopaque {
 
 fn getLocalContext(ctx: ?*anyopaque) ?*anyopaque {
     _ = ctx;
-
     return Thread.current().io_ctx;
 }
 
@@ -398,12 +463,9 @@ fn @"async"(
 
     task.context_alignment = ca;
 
-    var fiber: Fiber = undefined;
-    fiber.init(rt.allocator, 1024 * 1024, AsyncTask.call, @ptrCast(task)) catch unreachable;
-    task.fiber = fiber;
+    task.fiber.init(rt.allocator, 1024 * 1024, AsyncTask.call, @ptrCast(task)) catch unreachable;
 
-    const t = Thread.current();
-    t.insertFiber(&task.fiber);
+    rt.schedule(&task.fiber);
 
     return @ptrCast(task);
 }
@@ -435,9 +497,7 @@ fn @"await"(
     rt.allocator.destroy(task);
 }
 
-/// —————————————————————————————————————————————————————————————————————
 /// asyncDetached: fire‑and‑forget on a real thread
-/// —————————————————————————————————————————————————————————————————————
 fn asyncDetached(
     ctx: ?*anyopaque,
     context: []const u8,
@@ -453,21 +513,10 @@ fn asyncDetached(
 
     @memcpy(context_buf, context);
 
-    const thread = std.Thread.spawn(.{}, Thread.entry, .{
-        rt,
-        context_buf,
-        ca,
-        start,
-    }) catch unreachable;
-    rt.threads.mutex.lock();
-    const thread_id = rt.threads.list.len;
-    if (rt.threads.list.len != 0) {
-        rt.threads.list = rt.allocator.realloc(rt.threads.list, rt.threads.list.len + 1) catch unreachable;
-    } else {
-        rt.threads.list = rt.allocator.alloc(std.Thread, 1) catch unreachable;
-    }
-    rt.threads.list[thread_id] = thread;
-    rt.threads.mutex.unlock();
+    var fiber: *Fiber = rt.allocator.create(Fiber) catch unreachable;
+    fiber.init(rt.allocator, 1024 * 1024, start, @ptrCast(context_buf.ptr)) catch unreachable;
+
+    rt.schedule(fiber);
 }
 
 /// simply set ourselves to blocking, we wont unblock until we get woken up
@@ -476,7 +525,7 @@ fn @"suspend"(ctx: ?*anyopaque) Cancelable!void {
     const me = Fiber.current().?;
     me.block();
 
-    if (me.canceled) {
+    if (me.isCanceled()) {
         return error.Canceled;
     }
 }
@@ -489,7 +538,8 @@ fn cancel(ctx: ?*anyopaque, any_future: *Runtime.AnyFuture, result: []u8, ra: st
     if (task.fiber.state != .finished) {
         std.log.info("awaiting task, blocking", .{});
 
-        task.fiber.canceled = true;
+        // set fiber to canceled
+        task.fiber.cancel();
         task.fiber.wake();
 
         const me = Fiber.current().?;
