@@ -96,10 +96,14 @@ pub fn pread(ctx: ?*anyopaque, rt: Runtime, file: Io.File, buffer: []u8, offset:
     const sqe = thread_ctx.io_uring.get_sqe() catch {
         return error.SystemResources;
     };
+
     sqe.prep_read(file.handle, buffer, @bitCast(offset));
     sqe.user_data = @intFromPtr(&read_op);
 
-    rt.@"suspend"();
+    rt.@"suspend"() catch {
+        sqe.prep_cancel(0, 0);
+        return error.Canceled;
+    };
 
     switch (errno(read_op.result)) {
         .SUCCESS => return @as(u32, @bitCast(read_op.result)),
@@ -132,7 +136,10 @@ pub fn pwrite(ctx: ?*anyopaque, rt: Runtime, file: Io.File, buffer: []const u8, 
     sqe.user_data = @intFromPtr(&write_op);
 
     // Suspend until the operation completes
-    rt.@"suspend"();
+    rt.@"suspend"() catch {
+        sqe.prep_cancel(0, 0);
+        return error.Canceled;
+    };
 
     switch (errno(write_op.result)) {
         .SUCCESS => return @as(u32, @bitCast(write_op.result)),

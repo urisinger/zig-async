@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const Runtime = @import("Runtime.zig");
+const Cancelable = Runtime.Cancelable;
 const Io = @import("Io.zig");
 
 const log = std.log.scoped(.Fibers);
@@ -21,6 +22,7 @@ const vtable: Runtime.VTable = .{
     .asyncDetached = asyncDetached,
     .@"await" = @"await",
     .@"suspend" = @"suspend",
+    .cancel = cancel,
     .select = select,
     .wake = wake,
     .getWaker = getWaker,
@@ -71,28 +73,17 @@ const Context = switch (builtin.cpu.arch) {
         rsp: u64 = 0,
         rbp: u64 = 0,
         rip: u64 = 0,
-        rbx: u64 = 0,
-        r12: u64 = 0,
-        r13: u64 = 0,
-        r14: u64 = 0,
-        r15: u64 = 0,
 
         fn init(entry_rip: usize, stack: usize) @This() {
             return .{
                 .rsp = stack - 8,
                 .rbp = 0,
                 .rip = entry_rip,
-                .rbx = 0,
-                .r12 = 0,
-                .r13 = 0,
-                .r14 = 0,
-                .r15 = 0,
             };
         }
     },
     else => |arch| @compileError("unimplemented architecture: " ++ @tagName(arch)),
 };
-const CallingConvention = std.builtin.CallingConvention;
 
 fn contextSwitch(old_ctx: *Context, new_ctx: *const Context) callconv(switch (builtin.cpu.arch) {
     .x86_64 => .{ .x86_64_sysv = .{} },
@@ -104,26 +95,16 @@ fn contextSwitch(old_ctx: *Context, new_ctx: *const Context) callconv(switch (bu
             \\ movq %%rsp, 0(%%rax)
             \\ movq %%rbp, 8(%%rax)
             \\ movq $ret, 16(%%rax)
-            \\ movq %%rbx, 24(%%rax)
-            \\ movq %%r12, 32(%%rax)
-            \\ movq %%r13, 40(%%rax)
-            \\ movq %%r14, 48(%%rax)
-            \\ movq %%r15, 56(%%rax)
 
             // Restore new context
             \\ movq 0(%%rcx), %%rsp
             \\ movq 8(%%rcx), %%rbp
-            \\ movq 24(%%rcx), %%rbx
-            \\ movq 32(%%rcx), %%r12
-            \\ movq 40(%%rcx), %%r13
-            \\ movq 48(%%rcx), %%r14
-            \\ movq 56(%%rcx), %%r15
             \\ jmpq *16(%%rcx) // jump to RIP
             \\ ret:
             :
             : [old] "{rax}" (old_ctx),
               [new] "{rcx}" (new_ctx),
-            : "rax", "rcx", "rdx", "rsi", "rdi", "r8", "r9", "r10", "r11", "memory"
+            : "rax", "rcx", "rbx", "r12", "r13", "r14", "r15", "memory"
         ),
         else => |arch| @compileError("unimplemented architecture: " ++ @tagName(arch)),
     }
@@ -140,8 +121,18 @@ const Fiber = struct {
     next_fiber: *Fiber,
     prev_fiber: *Fiber,
 
+    state: State = .running,
+
+    canceled: bool = false,
+
+    const State = enum {
+        running,
+        waiting,
+        finished,
+    };
+
     /// Initialize a Fiber: alloc a stack, set up a context that will
-    pub fn init(
+    fn init(
         self: *Fiber,
         allocator: std.mem.Allocator,
         stack_size: usize,
@@ -154,10 +145,22 @@ const Fiber = struct {
         self.arg = arg;
 
         const top = @intFromPtr(stack.ptr) + stack.len * @sizeOf(usize);
-        self.ctx = .init(@intFromPtr(&fiberTrampoline), top);
+        self.ctx = .init(@intFromPtr(&trampoline), top);
+        self.state = .running;
 
         self.next_fiber = self;
         self.prev_fiber = self;
+    }
+
+    fn trampoline() callconv(.C) void {
+        const t = Thread.current();
+        const fib = t.running_queue.?;
+        fib.entry(fib.arg);
+
+        // Remove us from the running queue
+        t.running_queue = fib.remove();
+
+        contextSwitch(&fib.ctx, t.currentContext());
     }
 
     pub fn deinit(self: *Fiber, allocator: std.mem.Allocator) void {
@@ -175,6 +178,8 @@ const Fiber = struct {
             t.running_queue = new_head;
         }
 
+        fiber.state = .waiting;
+
         t.yeild(&fiber.ctx);
     }
 
@@ -182,23 +187,14 @@ const Fiber = struct {
         // Remove ourselves from the blocking queue
         const t = Thread.current();
 
-        t.insertFiber(fiber);
+        if (fiber.state == .waiting) {
+            t.insertFiber(fiber);
+            fiber.state = .running;
+        }
     }
 
     pub fn current() ?*Fiber {
         return Thread.current().running_queue;
-    }
-
-    // Reuse a fiber, set a new entry point and create a new context.
-    pub fn recycle(fiber: *Fiber, entry: *const fn (*anyopaque) void, arg: *anyopaque) void {
-        fiber.entry = entry;
-        fiber.arg = arg;
-
-        const stack = fiber.buf;
-        const top = @intFromPtr(stack[stack.len..].ptr);
-        fiber.ctx.* = .init(@intFromPtr(fiberTrampoline), top);
-        fiber.next_fiber = fiber;
-        fiber.prev_fiber = fiber;
     }
 
     /// Insert `new_fiber` *after* `self` in the circular doubly-linked list.
@@ -235,18 +231,21 @@ const Fiber = struct {
 
         return self.next_fiber;
     }
+
+    pub fn printQueue(self: *Fiber) void {
+        var cur = self;
+        while (cur.next_fiber != self) {
+            cur.print();
+            cur = cur.next_fiber;
+        }
+
+        cur.print();
+    }
+
+    pub fn print(self: *Fiber) void {
+        log.info("Fiber: {x}", .{@intFromPtr(self)});
+    }
 };
-
-fn fiberTrampoline() callconv(.C) void {
-    const t = Thread.current();
-    const fib = t.running_queue.?;
-    fib.entry(fib.arg);
-
-    // Remove us from the running queue
-    t.running_queue = fib.remove();
-
-    contextSwitch(&fib.ctx, t.currentContext());
-}
 
 // For now a thread is basiclly a detached fiber, later on we can make it steal work from other threads
 const Thread = struct {
@@ -348,17 +347,16 @@ const AsyncTask = struct {
     context_alignment: std.mem.Alignment,
     waiter: ?*Fiber,
 
-    finished: bool = false,
-
     fn call(arg: *anyopaque) void {
         const task: *AsyncTask = @alignCast(@ptrCast(arg));
         task.start(@ptrCast(task.context_buf.ptr), @ptrCast(task.result_slice.ptr));
 
         if (task.waiter) |w| {
+            std.log.info("task finished, waking up", .{});
             w.wake();
         }
         task.waiter = null;
-        task.finished = true;
+        task.fiber.state = .finished;
     }
 
     fn deinit(self: *AsyncTask, allocator: std.mem.Allocator, result_alignment: std.mem.Alignment) void {
@@ -398,12 +396,11 @@ fn @"async"(
     task.waiter = null;
     task.start = start;
 
+    task.context_alignment = ca;
+
     var fiber: Fiber = undefined;
     fiber.init(rt.allocator, 1024 * 1024, AsyncTask.call, @ptrCast(task)) catch unreachable;
     task.fiber = fiber;
-    task.context_alignment = ca;
-
-    task.finished = false;
 
     const t = Thread.current();
     t.insertFiber(&task.fiber);
@@ -424,7 +421,7 @@ fn @"await"(
     const task: *AsyncTask = @alignCast(@ptrCast(any_future));
 
     // If task hasnt finished yet, we block until its done
-    if (!task.finished) {
+    if (task.fiber.state != .finished) {
         const me = Fiber.current().?;
         task.waiter = me;
         me.block();
@@ -473,18 +470,42 @@ fn asyncDetached(
     rt.threads.mutex.unlock();
 }
 
-/// —————————————————————————————————————————————————————————————————————
-/// suspend: simply set ourselves to blocking, we wont unblock until we get woken up
-/// —————————————————————————————————————————————————————————————————————
-fn @"suspend"(ctx: ?*anyopaque) void {
+/// simply set ourselves to blocking, we wont unblock until we get woken up
+fn @"suspend"(ctx: ?*anyopaque) Cancelable!void {
     _ = ctx;
     const me = Fiber.current().?;
     me.block();
+
+    if (me.canceled) {
+        return error.Canceled;
+    }
 }
 
-/// —————————————————————————————————————————————————————————————————————
-/// select: wait on multiple futures
-/// —————————————————————————————————————————————————————————————————————
+fn cancel(ctx: ?*anyopaque, any_future: *Runtime.AnyFuture, result: []u8, ra: std.mem.Alignment) void {
+    const rt: *Fibers = @alignCast(@ptrCast(ctx.?));
+
+    const task: *AsyncTask = @alignCast(@ptrCast(any_future));
+
+    if (task.fiber.state != .finished) {
+        std.log.info("awaiting task, blocking", .{});
+
+        task.fiber.canceled = true;
+        task.fiber.wake();
+
+        const me = Fiber.current().?;
+        task.waiter = me;
+
+        me.block();
+    }
+    // when resumed, result has been written in-place:
+    @memcpy(result, task.result_slice);
+
+    // Only now can we free the task.
+    task.deinit(rt.allocator, ra);
+    rt.allocator.destroy(task);
+}
+
+/// wait on multiple futures
 fn select(
     ctx: ?*anyopaque,
     futures: []const *Runtime.AnyFuture,
@@ -501,11 +522,10 @@ fn select(
     me.block();
 
     i = 0;
-    // find the one that completed
     for (futures) |afut| {
         const t: *AsyncTask = @alignCast(@ptrCast(afut));
 
-        if (t.finished) {
+        if (t.fiber.state == .finished) {
             return i;
         }
         i += 1;

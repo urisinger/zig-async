@@ -16,22 +16,20 @@ pub fn main() !void {
 
     rt.asyncDetached(run, .{rt});
 
+    std.log.info("hi form main", .{});
     fibers.join();
 
     fibers.deinit();
-
-    const check = gpa.deinit();
-    if (check == .leak) {
-        std.log.err("leak", .{});
-    }
 }
 
 pub fn run(rt: Runtime) void {
     var fut1 = rt.@"async"(run1, .{rt});
     var fut3 = rt.@"async"(run3, .{rt});
+    _ = fut3.cancel(rt);
+
+    log.info("hi", .{});
     var fut2 = rt.@"async"(run2, .{rt});
 
-    _ = fut3.@"await"(rt);
     _ = fut1.@"await"(rt);
     _ = fut2.@"await"(rt);
 
@@ -60,7 +58,15 @@ pub fn run3(rt: Runtime) usize {
     @memset(&res, 1);
     const read = file.read(
         &res,
-    ) catch unreachable;
+    ) catch |e| {
+        switch (e) {
+            error.Canceled => {
+                log.info("canceled", .{});
+                return 0;
+            },
+            else => return 0,
+        }
+    };
 
     file.close();
 

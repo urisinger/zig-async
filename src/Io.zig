@@ -3,6 +3,8 @@ const Runtime = @import("Runtime.zig");
 
 const fs = std.fs;
 
+const Cancelable = Runtime.Cancelable;
+
 pub const VTable = struct {
     createContext: *const fn (global_ctx: ?*anyopaque) ?*anyopaque,
     onPark: *const fn (global_ctx: ?*anyopaque, runtime: Runtime) void,
@@ -23,31 +25,31 @@ pub const File = struct {
     pub const OpenFlags = fs.File.OpenFlags;
     pub const CreateFlags = fs.File.CreateFlags;
 
-    pub const OpenError = fs.File.OpenError;
+    pub const OpenError = Cancelable || fs.File.OpenError;
 
     pub fn close(file: File) void {
         return file.runtime.io.vtable.closeFile(file.runtime.io.ctx, file.runtime, file);
     }
 
-    pub const ReadError = fs.File.ReadError;
+    pub const ReadError = Cancelable || fs.File.ReadError;
 
     pub fn read(file: File, buffer: []u8) ReadError!usize {
         return @errorCast(file.pread(buffer, -1));
     }
 
-    pub const PReadError = fs.File.PReadError;
+    pub const PReadError = Cancelable || fs.File.PReadError;
 
     pub fn pread(file: File, buffer: []u8, offset: std.posix.off_t) PReadError!usize {
         return file.runtime.io.vtable.pread(file.runtime.io.ctx, file.runtime, file, buffer, offset);
     }
 
-    pub const WriteError = fs.File.WriteError;
+    pub const WriteError = Cancelable || fs.File.WriteError;
 
     pub fn write(file: File, buffer: []const u8) WriteError!usize {
         return @errorCast(file.pwrite(buffer, -1));
     }
 
-    pub const PWriteError = fs.File.PWriteError;
+    pub const PWriteError = Cancelable || fs.File.PWriteError;
 
     pub fn pwrite(file: File, buffer: []const u8, offset: std.posix.off_t) PWriteError!usize {
         return file.runtime.io.vtable.pwrite(file.runtime.io.ctx, file.runtime, file, buffer, offset);

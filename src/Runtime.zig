@@ -11,6 +11,11 @@ vtable: *const VTable,
 
 io: Io,
 
+pub const Cancelable = error{
+    /// Caller has requested the async operation to stop.
+    Canceled,
+};
+
 pub const VTable = struct {
     @"async": *const fn (
         ctx: ?*anyopaque,
@@ -54,7 +59,18 @@ pub const VTable = struct {
     select: *const fn (ctx: ?*anyopaque, futures: []const *AnyFuture) usize,
 
     // Suspends this future until Io wakes it up
-    @"suspend": *const fn (ctx: ?*anyopaque) void,
+    @"suspend": *const fn (ctx: ?*anyopaque) Cancelable!void,
+
+    cancel: *const fn (
+        /// Corresponds to `Runtime.ctx`.
+        ctx: ?*anyopaque,
+        /// The same value that was returned from `async`.
+        any_future: *AnyFuture,
+        /// Points to a buffer where the result is written.
+        /// The length is equal to size in bytes of result type.
+        result: []u8,
+        result_alignment: std.mem.Alignment,
+    ) void,
 
     wake: *const fn (ctx: ?*anyopaque, fut: *anyopaque) void,
 
@@ -65,8 +81,9 @@ pub const VTable = struct {
     getLocalContext: *const fn (ctx: ?*anyopaque) ?*anyopaque,
 };
 
-pub fn @"suspend"(runtime: Runtime) void {
-    runtime.vtable.@"suspend"(runtime.ctx);
+// Returns true if cancled
+pub fn @"suspend"(runtime: Runtime) Cancelable!void {
+    return runtime.vtable.@"suspend"(runtime.ctx);
 }
 
 pub fn wake(runtime: Runtime, fut: *anyopaque) void {
@@ -87,6 +104,17 @@ pub fn Future(Result: type) type {
     return struct {
         any_future: ?*AnyFuture,
         result: Result,
+
+        /// Equivalent to `await` but sets a flag observable to application
+        /// code that cancellation has been requested.
+        ///
+        /// Idempotent.
+        pub fn cancel(f: *@This(), runtime: Runtime) Result {
+            const any_future = f.any_future orelse return f.result;
+            runtime.vtable.cancel(runtime.ctx, any_future, @ptrCast((&f.result)[0..1]), std.mem.Alignment.fromByteUnits(@alignOf(Result)));
+            f.any_future = null;
+            return f.result;
+        }
 
         pub fn @"await"(f: *@This(), runtime: Runtime) Result {
             const any_future = f.any_future orelse return f.result;
