@@ -27,9 +27,6 @@ pub fn createContext(global_ctx: ?*anyopaque) ?*anyopaque {
 
     const thread_ctx = event_loop.allocator.create(ThreadContext) catch unreachable;
     thread_ctx.* = ThreadContext.init(event_loop);
-    _  = thread_ctx.io_uring.submit() catch unreachable;
-
-    log.info("Created event loop context", .{});
 
     return @ptrCast(thread_ctx);
 }
@@ -188,8 +185,17 @@ fn wakeThread(global_ctx: ?*anyopaque, rt: Runtime, other_thread_ctx: ?*anyopaqu
         @panic("failed to get sqe");
     };
 
-    sqe.prep_rw(.MSG_RING, other_thread.io_uring.fd, 0, WAKE_TASK_MAGIC, WAKE_TASK_MAGIC);
-    sqe.user_data = @intFromPtr(task);
+    std.log.info("other_thread: {}", .{@intFromPtr(other_thread)});
+
+    if (other_thread == cur_thread) {
+        std.log.info("waking thread on same thread", .{});
+        rt.wake(task);
+        return;
+    }
+
+    std.log.info("fd: {}", .{other_thread.io_uring.fd});
+
+    sqe.prep_rw(.MSG_RING, other_thread.io_uring.fd, 0, WAKE_TASK_MAGIC, @intFromPtr(task));
 }
 
 fn onPark(global_ctx: ?*anyopaque, rt: Runtime) void {
@@ -214,9 +220,13 @@ fn onPark(global_ctx: ?*anyopaque, rt: Runtime) void {
     // Process completed operations
     for (cqes[0..completed]) |cqe| {
         const user_data = cqe.user_data;
+        if (user_data == 0) continue;
 
         // If the user data is 0, skip this entry
-        std.log.info("0x{x}, e: {}", .{@as(u32, @bitCast(cqe.res)), errno(cqe.res)});
+        std.log.info("0x{x}, e: 0x{x}", .{
+            @as(u32, @bitCast(cqe.res)),
+            cqe.user_data,
+        });
 
         // Check if this is a wake-up message by looking at the len field in the result
         // For wake-up messages, the len field contains our magic value

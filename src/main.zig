@@ -28,10 +28,10 @@ pub fn run(rt: Runtime) void {
     var fut2 = rt.@"async"(run2, .{rt});
     var fut3 = rt.@"async"(run3, .{rt});
 
+    _ = fut3.cancel(rt);
+
     _ = fut1.@"await"(rt);
     _ = fut2.@"await"(rt);
-
-    _ = fut3.cancel(rt);
 
     log.info("main finished", .{});
 }

@@ -77,7 +77,6 @@ pub fn shutdown(self: *Fibers) void {
     const free_threads = self.free_threads.list.clone() catch unreachable;
     self.free_threads.mutex.unlock();
 
-
     free_threads.deinit();
 }
 
@@ -155,7 +154,15 @@ fn schedule(rt: *Fibers, fiber: *Fiber) void {
         fiber.thread = thread;
         rt.io.vtable.wakeThread(rt.io.ctx, rt.runtime(), @ptrCast(thread), @ptrCast(fiber));
     } else {
-        const thread = std.Thread.spawn(.{}, Thread.entry, .{ rt, fiber }) catch |err| {
+        const t = rt.allocator.create(Thread) catch unreachable;
+        t.* = .{
+            .rt = rt,
+            .running_queue = fiber,
+            .idle_context = .{},
+            .io_ctx = rt.io.vtable.createContext(rt.io.ctx),
+        };
+        fiber.thread = t;
+        const thread = std.Thread.spawn(.{}, Thread.entry, .{ rt, t }) catch |err| {
             std.log.err("failed to spawn thread: {s}", .{@errorName(err)});
             unreachable;
         };
@@ -255,7 +262,7 @@ const Fiber = struct {
         fiber.thread.?.rt.io.vtable.wakeThread(
             fiber.thread.?.rt.io.ctx,
             fiber.thread.?.rt.runtime(),
-            @ptrCast(fiber.thread.?),
+            @ptrCast(fiber.thread.?.io_ctx),
             @ptrCast(fiber),
         );
     }
@@ -349,31 +356,25 @@ const Thread = struct {
         }
     }
 
-    fn entry(rt: *Fibers, main_fiber: *Fiber) void {
-        var t: Thread = .{
-            .rt = rt,
-            .running_queue = main_fiber,
-            .idle_context = .{},
-            .io_ctx = rt.io.vtable.createContext(rt.io.ctx),
-        };
-        main_fiber.thread = &t;
-        self = &t;
+    fn entry(rt: *Fibers, t: *Thread) void {
+        self = t;
+        while (true) {
+            if (self.running_queue) |fiber| {
+                const old_ctx = &self.idle_context;
+                const new_ctx = &fiber.ctx;
 
-        while (t.running_queue) |fiber| {
-            const old_ctx = &self.idle_context;
-            const new_ctx = &fiber.ctx;
+                std.log.info("switching to fiber", .{});
 
-            std.log.info("switching to fiber", .{});
+                contextSwitch(old_ctx, new_ctx);
 
-            contextSwitch(old_ctx, new_ctx);
+                rt.free_threads.mutex.lock();
+                rt.free_threads.list.append(t) catch |err| {
+                    std.log.err("failed to append thread to free list: {s}", .{@errorName(err)});
+                    unreachable;
+                };
+                rt.free_threads.mutex.unlock();
+            }
 
-            rt.free_threads.mutex.lock();
-            rt.free_threads.list.append(&t) catch |err| {
-                std.log.err("failed to append thread to free list: {s}", .{@errorName(err)});
-                unreachable;
-            };
-            rt.free_threads.mutex.unlock();
-            
             rt.io.vtable.onPark(rt.io.ctx, rt.runtime());
         }
 
@@ -536,8 +537,6 @@ fn cancel(ctx: ?*anyopaque, any_future: *Runtime.AnyFuture, result: []u8, ra: st
     const task: *AsyncTask = @alignCast(@ptrCast(any_future));
 
     if (task.fiber.state != .finished) {
-        std.log.info("awaiting task, blocking", .{});
-
         // set fiber to canceled
         task.fiber.cancel();
         task.fiber.wake();
