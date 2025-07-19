@@ -7,10 +7,11 @@ const Cancelable = Runtime.Cancelable;
 
 pub const VTable = struct {
     createContext: *const fn (global_ctx: ?*anyopaque) ?*anyopaque,
-    onPark: *const fn (global_ctx: ?*anyopaque, runtime: Runtime) void,
+    onPark: *const fn (global_ctx: ?*anyopaque, runtime: Runtime) bool,
+    exitThread: *const fn (global_ctx: ?*anyopaque, runtime: Runtime, thread_ctx: ?*anyopaque) void,
 
     // wake up a thread with a task to run
-    wakeThread: *const fn (global_ctx: ?*anyopaque, runtime: Runtime, other_thread_ctx: ?*anyopaque, task: *anyopaque) void,
+    wakeThread: *const fn (global_ctx: ?*anyopaque, runtime: Runtime, other_thread_ctx: ?*anyopaque) void,
 
     //createFile: *const fn (global_ctx: ?*anyopaque, runtime: runtime, path: []const u8, flags: File.CreateFlags) File.OpenError!File,
     openFile: *const fn (global_ctx: ?*anyopaque, runtime: Runtime, path: []const u8, flags: File.OpenFlags) File.OpenError!File,

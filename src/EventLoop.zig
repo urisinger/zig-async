@@ -46,6 +46,7 @@ const Operation = struct {
 const vtable: Io.VTable = .{
     .createContext = createContext,
     .onPark = onPark,
+    .exitThread = exitThread,
     .openFile = openFile,
     .closeFile = closeFile,
     .pread = pread,
@@ -171,13 +172,9 @@ pub fn closeFile(ctx: ?*anyopaque, rt: Runtime, file: Io.File) void {
     std.posix.close(file.handle);
 }
 
-// Magic value to distinguish wake-up messages from regular I/O operations
-// Using a large value that won't conflict with normal I/O lengths
-const WAKE_TASK_MAGIC: u32 = 0xDEADBEEF;
-
-fn wakeThread(global_ctx: ?*anyopaque, rt: Runtime, other_thread_ctx: ?*anyopaque, task: *anyopaque) void {
+fn wakeThread(global_ctx: ?*anyopaque, rt: Runtime, other_thread_ctx: ?*anyopaque) void {
     _ = global_ctx;
-    std.log.info("waking thread", .{});
+    log.info("wakeThread", .{});
     const other_thread: *ThreadContext = @alignCast(@ptrCast(other_thread_ctx));
     const cur_thread: *ThreadContext = @alignCast(@ptrCast(rt.getLocalContext()));
 
@@ -185,25 +182,28 @@ fn wakeThread(global_ctx: ?*anyopaque, rt: Runtime, other_thread_ctx: ?*anyopaqu
         @panic("failed to get sqe");
     };
 
-    std.log.info("other_thread: {}", .{@intFromPtr(other_thread)});
-
-    if (other_thread == cur_thread) {
-        std.log.info("waking thread on same thread", .{});
-        rt.wake(task);
-        return;
-    }
-
-    std.log.info("fd: {}", .{other_thread.io_uring.fd});
-
-    sqe.prep_rw(.MSG_RING, other_thread.io_uring.fd, 0, WAKE_TASK_MAGIC, @intFromPtr(task));
+    // 1 is for fiber wakeup
+    sqe.prep_rw(.MSG_RING, other_thread.io_uring.fd, 0, 0, 1);
 }
 
-fn onPark(global_ctx: ?*anyopaque, rt: Runtime) void {
+fn exitThread(global_ctx: ?*anyopaque, rt: Runtime, thread_ctx: ?*anyopaque) void {
+    _ = global_ctx;
+    const other_thread: *ThreadContext = @alignCast(@ptrCast(thread_ctx));
+    const cur_thread: *ThreadContext = @alignCast(@ptrCast(rt.getLocalContext()));
+
+    const sqe = cur_thread.io_uring.get_sqe() catch {
+        @panic("failed to get sqe");
+    };
+    // 2 is for thread exit
+    sqe.prep_rw(.MSG_RING, other_thread.io_uring.fd, 0, 0, 2);
+}
+
+// Should exit
+fn onPark(global_ctx: ?*anyopaque, rt: Runtime) bool {
+    log.info("parked", .{});
     const event_loop: *EventLoop = @alignCast(@ptrCast(global_ctx));
     _ = event_loop;
     const thread_ctx: *ThreadContext = @alignCast(@ptrCast(rt.getLocalContext()));
-
-    log.info("parked", .{});
 
     const io_uring = &thread_ctx.io_uring;
 
@@ -214,27 +214,23 @@ fn onPark(global_ctx: ?*anyopaque, rt: Runtime) void {
     var cqes: [io_uring_entries]std.os.linux.io_uring_cqe = undefined;
     const completed = io_uring.copy_cqes(&cqes, 1) catch {
         log.err("Failed to get completion events", .{});
-        return;
+        return false;
     };
 
     // Process completed operations
     for (cqes[0..completed]) |cqe| {
         const user_data = cqe.user_data;
-        if (user_data == 0) continue;
-
-        // If the user data is 0, skip this entry
-        std.log.info("0x{x}, e: 0x{x}", .{
-            @as(u32, @bitCast(cqe.res)),
-            cqe.user_data,
-        });
-
-        // Check if this is a wake-up message by looking at the len field in the result
-        // For wake-up messages, the len field contains our magic value
-        if (@as(u32, @bitCast(cqe.res)) == WAKE_TASK_MAGIC) {
-            // This is a wake-up message, the user_data contains the task pointer
-            const task: *anyopaque = @ptrFromInt(user_data);
-            rt.wake(task);
-            break;
+        switch (user_data) {
+            0 => continue,
+            1 => {
+                log.info("woken up by another thread, {}", .{@as(u32, @bitCast(cqe.res))});
+                continue;
+            },
+            // 2 is for thread exit
+            2 => {
+                return true;
+            },
+            else => {},
         }
 
         // Regular I/O operation completion
@@ -246,6 +242,9 @@ fn onPark(global_ctx: ?*anyopaque, rt: Runtime) void {
         // Wake up the suspended future
         rt.wake(base_op.waker);
     }
+
+    log.info("completed", .{});
+    return false;
 }
 
 fn errno(signed: i32) std.posix.E {

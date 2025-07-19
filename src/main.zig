@@ -4,6 +4,35 @@ const Runtime = @import("Runtime.zig");
 const Fibers = @import("Fibers.zig");
 const EventLoop = @import("EventLoop.zig");
 
+pub const std_options: std.Options = .{
+    .logFn = logfn,
+};
+
+fn formatTimestamp(timestamp: u64, buf: []u8) []u8 {
+    const ms_in_day = 24 * 60 * 60 * 1000;
+    const ms_in_hour = 60 * 60 * 1000;
+    const ms_in_minute = 60 * 1000;
+
+    const ms_today = timestamp % ms_in_day;
+    const hours = ms_today / ms_in_hour;
+    const minutes = (ms_today % ms_in_hour) / ms_in_minute;
+    const seconds = (ms_today % ms_in_minute) / 1000;
+    const milliseconds = ms_today % 1000;
+
+    return std.fmt.bufPrint(buf, "{:02}:{:02}:{:02}.{:03}", .{ hours, minutes, seconds, milliseconds }) catch "00:00:00.000";
+}
+
+fn logfn(
+    comptime level: std.log.Level,
+    comptime scope: @Type(.enum_literal),
+    comptime format: []const u8,
+    args: anytype,
+) void {
+    const thread_id = std.Thread.getCurrentId();
+
+    std.log.defaultLog(level, scope, "Thread id: {d} " ++ format, .{thread_id} ++ args);
+}
+
 pub fn main() !void {
     var gpa: std.heap.DebugAllocator(.{}) = .init;
 
@@ -16,22 +45,25 @@ pub fn main() !void {
 
     rt.asyncDetached(run, .{rt});
 
-    std.log.info("hi form", .{});
     fibers.join();
 
     fibers.deinit();
 }
 
 pub fn run(rt: Runtime) void {
-    var fut1 = rt.@"async"(run1, .{rt});
     log.info("hi", .{});
-    var fut2 = rt.@"async"(run2, .{rt});
     var fut3 = rt.@"async"(run3, .{rt});
 
     _ = fut3.cancel(rt);
 
+    var fut2 = rt.@"async"(run1, .{rt});
+
+    var fut1 = rt.@"async"(run2, .{rt});
+
     _ = fut1.@"await"(rt);
     _ = fut2.@"await"(rt);
+
+    log.info("i am here", .{});
 
     log.info("main finished", .{});
 }
