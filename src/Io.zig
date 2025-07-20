@@ -7,8 +7,9 @@ const Cancelable = Runtime.Cancelable;
 
 pub const VTable = struct {
     createContext: *const fn (global_ctx: ?*anyopaque) ?*anyopaque,
+    destroyContext: *const fn (global_ctx: ?*anyopaque, runtime: Runtime, context: ?*anyopaque) void,
     onPark: *const fn (global_ctx: ?*anyopaque, runtime: Runtime) bool,
-    exitThread: *const fn (global_ctx: ?*anyopaque, runtime: Runtime, thread_ctx: ?*anyopaque) void,
+    signalExit: *const fn (global_ctx: ?*anyopaque, runtime: Runtime, signaled_thread: ?*anyopaque) void,
 
     // wake up a thread with a task to run
     wakeThread: *const fn (global_ctx: ?*anyopaque, runtime: Runtime, other_thread_ctx: ?*anyopaque) void,

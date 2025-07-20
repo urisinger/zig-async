@@ -20,6 +20,10 @@ const ThreadContext = struct {
     pub fn init(event_loop: *EventLoop) ThreadContext {
         return .{ .io_uring = IoUring.init(io_uring_entries, 0) catch unreachable, .event_loop = event_loop };
     }
+
+    pub fn deinit(self: *ThreadContext) void {
+        self.io_uring.deinit();
+    }
 };
 
 pub fn createContext(global_ctx: ?*anyopaque) ?*anyopaque {
@@ -29,6 +33,14 @@ pub fn createContext(global_ctx: ?*anyopaque) ?*anyopaque {
     thread_ctx.* = ThreadContext.init(event_loop);
 
     return @ptrCast(thread_ctx);
+}
+
+pub fn destroyContext(global_ctx: ?*anyopaque, runtime: Runtime, context: ?*anyopaque) void {
+    _ = runtime;
+    const event_loop: *EventLoop = @alignCast(@ptrCast(global_ctx));
+    const thread_ctx: *ThreadContext = @alignCast(@ptrCast(context));
+    thread_ctx.deinit();
+    event_loop.allocator.destroy(thread_ctx);
 }
 
 pub fn init(allocator: Allocator) EventLoop {
@@ -45,8 +57,9 @@ const Operation = struct {
 
 const vtable: Io.VTable = .{
     .createContext = createContext,
+    .destroyContext = destroyContext,
     .onPark = onPark,
-    .exitThread = exitThread,
+    .signalExit = signalExit,
     .openFile = openFile,
     .closeFile = closeFile,
     .pread = pread,
@@ -186,7 +199,7 @@ fn wakeThread(global_ctx: ?*anyopaque, rt: Runtime, other_thread_ctx: ?*anyopaqu
     sqe.prep_rw(.MSG_RING, other_thread.io_uring.fd, 0, 0, 1);
 }
 
-fn exitThread(global_ctx: ?*anyopaque, rt: Runtime, thread_ctx: ?*anyopaque) void {
+fn signalExit(global_ctx: ?*anyopaque, rt: Runtime, thread_ctx: ?*anyopaque) void {
     _ = global_ctx;
     const other_thread: *ThreadContext = @alignCast(@ptrCast(thread_ctx));
     const cur_thread: *ThreadContext = @alignCast(@ptrCast(rt.getLocalContext()));

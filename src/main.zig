@@ -48,6 +48,8 @@ pub fn main() !void {
     fibers.join();
 
     fibers.deinit();
+
+    log.info("{}", .{gpa.deinit()});
 }
 
 pub fn run(rt: Runtime) void {

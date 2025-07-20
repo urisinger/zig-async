@@ -140,7 +140,7 @@ pub inline fn asyncDetached(runtime: Runtime, function: anytype, args: std.meta.
 
 /// Calls `function` with `args`, such that the return value of the function is
 /// not guaranteed to be available until `await` is called.
-pub inline fn @"async"(runtime: Runtime, function: anytype, args: std.meta.ArgsTuple(@TypeOf(function))) Future(@typeInfo(@TypeOf(function)).@"fn".return_type.?) {
+pub noinline fn @"async"(runtime: Runtime, function: anytype, args: std.meta.ArgsTuple(@TypeOf(function))) Future(@typeInfo(@TypeOf(function)).@"fn".return_type.?) {
     const Result = @typeInfo(@TypeOf(function)).@"fn".return_type.?;
     const Args = @TypeOf(args);
     const TypeErased = struct {
@@ -151,13 +151,22 @@ pub inline fn @"async"(runtime: Runtime, function: anytype, args: std.meta.ArgsT
         }
     };
     var future: Future(Result) = undefined;
+
+    const result_buf: []u8 = if (@sizeOf(Result) == 0) &.{} else @ptrCast((&future.result)[0..1]);
+    const result_alignment = std.mem.Alignment.fromByteUnits(@alignOf(Result));
+    const args_buf: []const u8 = if (@sizeOf(Args) == 0) &.{} else @ptrCast((&args)[0..1]);
+    const args_alignment = std.mem.Alignment.fromByteUnits(@alignOf(Args));
+    const start = TypeErased.start;
+    const ctx = runtime.ctx;
+
+    std.log.info("vtable is: {x}, async is: {x}", .{ @intFromPtr(runtime.vtable), @intFromPtr(runtime.vtable.@"async") });
     future.any_future = runtime.vtable.@"async"(
-        runtime.ctx,
-        if (@sizeOf(Result) == 0) &.{} else @ptrCast((&future.result)[0..1]),
-        std.mem.Alignment.fromByteUnits(@alignOf(Result)),
-        if (@sizeOf(Args) == 0) &.{} else @ptrCast((&args)[0..1]),
-        std.mem.Alignment.fromByteUnits(@alignOf(Args)),
-        TypeErased.start,
+        ctx,
+        result_buf,
+        result_alignment,
+        args_buf,
+        args_alignment,
+        start,
     );
     return future;
 }
