@@ -1,6 +1,8 @@
 const std = @import("std");
 const Runtime = @import("Runtime.zig");
 const Io = @import("Io.zig");
+const types = @import("types.zig");
+const EitherPtr = types.EitherPtr;
 
 const log = std.log.scoped(.EventLoop);
 
@@ -55,6 +57,9 @@ const Operation = struct {
     result: i32,
 };
 
+// Either a pointer to an operation,
+const Message = EitherPtr(*Operation, bool);
+
 const vtable: Io.VTable = .{
     .createContext = createContext,
     .destroyContext = destroyContext,
@@ -103,10 +108,12 @@ pub fn pread(ctx: ?*anyopaque, rt: Runtime, file: Io.File, buffer: []u8, offset:
     const thread_ctx: *ThreadContext = @alignCast(@ptrCast(rt.getLocalContext()));
 
     // Create read operation
-    const read_op: Operation = .{
+    var read_op: Operation = .{
         .waker = rt.getWaker(),
         .result = 0,
     };
+
+    const message = Message.initPtr(&read_op);
 
     // Submit read operation to io_uring
     const sqe = thread_ctx.io_uring.get_sqe() catch {
@@ -114,7 +121,7 @@ pub fn pread(ctx: ?*anyopaque, rt: Runtime, file: Io.File, buffer: []u8, offset:
     };
 
     sqe.prep_read(file.handle, buffer, @bitCast(offset));
-    sqe.user_data = @intFromPtr(&read_op);
+    sqe.user_data = message.toInner();
 
     rt.@"suspend"() catch {
         sqe.prep_cancel(0, 0);
@@ -144,12 +151,14 @@ pub fn pwrite(ctx: ?*anyopaque, rt: Runtime, file: Io.File, buffer: []const u8, 
         .result = 0,
     };
 
+    const message = Message.initPtr(&write_op);
+
     // Submit write operation to io_uring
     const sqe = thread_ctx.io_uring.get_sqe() catch {
         return error.SystemResources;
     };
     sqe.prep_write(file.handle, buffer, @bitCast(offset));
-    sqe.user_data = @intFromPtr(&write_op);
+    sqe.user_data = message.toInner();
 
     // Suspend until the operation completes
     rt.@"suspend"() catch {
@@ -195,8 +204,9 @@ fn wakeThread(global_ctx: ?*anyopaque, rt: Runtime, other_thread_ctx: ?*anyopaqu
         @panic("failed to get sqe");
     };
 
-    // 1 is for fiber wakeup
-    sqe.prep_rw(.MSG_RING, other_thread.io_uring.fd, 0, 0, 1);
+    const message = Message.initValue(false);
+
+    sqe.prep_rw(.MSG_RING, other_thread.io_uring.fd, 0, 0, message.toInner());
 }
 
 fn signalExit(global_ctx: ?*anyopaque, rt: Runtime, thread_ctx: ?*anyopaque) void {
@@ -207,8 +217,8 @@ fn signalExit(global_ctx: ?*anyopaque, rt: Runtime, thread_ctx: ?*anyopaque) voi
     const sqe = cur_thread.io_uring.get_sqe() catch {
         @panic("failed to get sqe");
     };
-    // 2 is for thread exit
-    sqe.prep_rw(.MSG_RING, other_thread.io_uring.fd, 0, 0, 2);
+    const message = Message.initValue(true);
+    sqe.prep_rw(.MSG_RING, other_thread.io_uring.fd, 0, 0, message.toInner());
 }
 
 // Should exit
@@ -232,28 +242,26 @@ fn onPark(global_ctx: ?*anyopaque, rt: Runtime) bool {
 
     // Process completed operations
     for (cqes[0..completed]) |cqe| {
-        const user_data = cqe.user_data;
-        switch (user_data) {
-            0 => continue,
-            1 => {
-                log.info("woken up by another thread, {}", .{@as(u32, @bitCast(cqe.res))});
-                continue;
-            },
-            // 2 is for thread exit
-            2 => {
-                return true;
-            },
-            else => {},
+        if (cqe.user_data == 0) {
+            continue;
         }
 
-        // Regular I/O operation completion
-        const base_op: *Operation = @ptrFromInt(user_data);
+        const message = Message.fromValue(@as(usize, cqe.user_data));
 
-        // Set the result based on the completion event
-        base_op.result = cqe.res;
+        switch (message.asUnion()) {
+            .value => |exit| {
+                if (exit) {
+                    return true;
+                }
+            },
+            .ptr => |op| {
+                // Set the result based on the completion event
+                op.result = cqe.res;
 
-        // Wake up the suspended future
-        rt.wake(base_op.waker);
+                // Wake up the suspended future
+                rt.wake(op.waker);
+            },
+        }
     }
 
     log.info("completed", .{});

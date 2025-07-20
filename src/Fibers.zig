@@ -3,6 +3,8 @@ const builtin = @import("builtin");
 const Runtime = @import("Runtime.zig");
 const Cancelable = Runtime.Cancelable;
 const Io = @import("Io.zig");
+const types = @import("types.zig");
+const EitherPtr = types.EitherPtr;
 
 const log = std.log.scoped(.Fibers);
 const assert = std.debug.assert;
@@ -110,7 +112,6 @@ pub fn join(self: *Fibers) void {
 }
 
 pub fn runtime(self: *Fibers) Runtime {
-    log.info("vtable is: {x}, async is: {x}", .{ @intFromPtr(&vtable), @intFromPtr(vtable.@"async") });
     return .{
         .vtable = &vtable,
         .ctx = @ptrCast(self),
@@ -427,8 +428,8 @@ const AsyncTask = struct {
     fiber: Fiber,
     start: *const fn (context: *const anyopaque, result: *anyopaque) void,
 
-    // Pointer to fiber, 0 if not awaited, 1 if finished
-    waiter: std.atomic.Value(usize) = .init(0),
+    // Either a pointer to fiber, or whether the task is finished
+    waiter: std.atomic.Value(EitherPtr(*Fiber, bool)) = .init(.initValue(false)),
 
     fn call(arg: *anyopaque) void {
         const task: *AsyncTask = @alignCast(@ptrCast(arg));
@@ -441,20 +442,16 @@ const AsyncTask = struct {
 
     // set waiter to 1 (finished)
     fn finish(self: *AsyncTask) ?*Fiber {
-        switch (self.waiter.swap(1, .acq_rel)) {
-            0 | 1 => return null,
-            else => |waiter| return @ptrFromInt(waiter),
-        }
+        return self.waiter.swap(.initValue(true), .acq_rel).asPtr();
     }
 
     // returns true if finished
     fn setWaiter(self: *AsyncTask, waiter: *Fiber) bool {
-        const last_waiter = self.waiter.swap(@intFromPtr(waiter), .acq_rel);
-        return last_waiter == 1;
+        return self.waiter.swap(.initPtr(waiter), .acq_rel).asValue() == true;
     }
 
     fn isFinished(self: *AsyncTask) bool {
-        return self.waiter.load(.acquire) == 1;
+        return self.waiter.load(.acquire).asValue() == true;
     }
 
     fn deinit(self: *AsyncTask, allocator: std.mem.Allocator) void {
@@ -477,20 +474,19 @@ noinline fn @"async"(
     const rt: *Fibers = @alignCast(@ptrCast(ctx.?));
 
     var task = rt.allocator.create(Fibers.AsyncTask) catch unreachable;
-
-    task.waiter.store(0, .release);
-    task.start = start;
-
-    task.fiber = Fiber.init(
-        rt.allocator,
-        1024 * 1024,
-        AsyncTask.call,
-        @ptrCast(task),
-        context,
-        ca,
-        result,
-        ra,
-    ) catch unreachable;
+    task.* = .{
+        .fiber = Fiber.init(
+            rt.allocator,
+            1024 * 1024,
+            AsyncTask.call,
+            @ptrCast(task),
+            context,
+            ca,
+            result,
+            ra,
+        ) catch unreachable,
+        .start = start,
+    };
 
     _ = rt.task_count.fetchAdd(1, .acq_rel);
     rt.schedule(&task.fiber);

@@ -159,7 +159,6 @@ pub noinline fn @"async"(runtime: Runtime, function: anytype, args: std.meta.Arg
     const start = TypeErased.start;
     const ctx = runtime.ctx;
 
-    std.log.info("vtable is: {x}, async is: {x}", .{ @intFromPtr(runtime.vtable), @intFromPtr(runtime.vtable.@"async") });
     future.any_future = runtime.vtable.@"async"(
         ctx,
         result_buf,
