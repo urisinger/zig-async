@@ -119,12 +119,6 @@ pub fn EitherPtr(comptime PtrT: type, comptime U: type) type {
     };
 }
 
-/// Compile-time calculation of required bits for a value
-fn bitsRequired(comptime max_value: usize) comptime_int {
-    if (max_value == 0) return 0;
-    return @bitSizeOf(usize) - @clz(max_value);
-}
-
 /// Get alignment bits available for packing
 fn getAlignmentBits(comptime T: type) usize {
     const alignment: usize = @alignOf(T);
@@ -134,9 +128,8 @@ fn getAlignmentBits(comptime T: type) usize {
 
 fn getHighBitsAvailable() usize {
     return switch (builtin.target.cpu.arch) {
-        .x86_64 => 16, // x86-64 uses 48-bit addresses, top 16 bits unused
-        .aarch64 => 8, // ARM64 commonly uses 56-bit addresses
-        else => 0, // Conservative for other architectures
+        .x86_64 => 16,
+        else => 0,
     };
 }
 
@@ -201,7 +194,7 @@ fn PackingStrategy(comptime T: type, comptime Tag: type) type {
 const PackingMethod = enum {
     Alignment, // Pack in low alignment bits
     HighBits, // Pack in high unused address bits
-    Packed, // Pointer in low
+    Packed, // Pointer in low bits, tag in high bits (sort of like a packed struct)
 };
 
 pub fn TaggedPtr(comptime PtrT: type, comptime Tag: type) type {
@@ -211,10 +204,8 @@ pub fn TaggedPtr(comptime PtrT: type, comptime Tag: type) type {
     return struct {
         const Self = @This();
 
-        // Storage based on optimal strategy
         value: usize,
 
-        // Compile-time constants
         const PACKING_METHOD = strategy.strategy;
         const TAG_BITS: usize = strategy.tag_bits;
         const ALIGNMENT_BITS = strategy.alignment_bits;
@@ -223,19 +214,16 @@ pub fn TaggedPtr(comptime PtrT: type, comptime Tag: type) type {
         // Whether PtrT is optional
         const IS_OPTIONAL = isOptional(PtrT);
 
-        // Masks and shifts for different packing methods
-        const LOW_TAG_BITS = @min(TAG_BITS, ALIGNMENT_BITS);
-        const HIGH_TAG_BITS = TAG_BITS;
+        const HIGH_BIT_SHIFT = @bitSizeOf(usize) - HIGH_BITS;
 
-        const LOW_TAG_MASK = (@as(usize, 1) << LOW_TAG_BITS) - 1;
-        const HIGH_TAG_MASK = (@as(usize, 1) << HIGH_TAG_BITS) - 1;
-        const HIGH_TAG_SHIFT = @bitSizeOf(usize) - HIGH_TAG_BITS;
+        const ALIGNMENT_MASK = (@as(usize, 1) << ALIGNMENT_BITS) - 1;
+        const HIGH_BITS_MASK = (@as(usize, 1) << HIGH_BITS) - 1;
 
         const PTR_BITS = @bitSizeOf(usize) - ALIGNMENT_BITS - HIGH_BITS;
 
         const PTR_MASK = switch (PACKING_METHOD) {
-            .Alignment => ~LOW_TAG_MASK,
-            .HighBits, .Packed => (@as(usize, 1) << (@bitSizeOf(usize) - HIGH_BITS)) - 1,
+            .Alignment => ~ALIGNMENT_MASK,
+            .HighBits, .Packed => ((@as(usize, 1) << HIGH_BIT_SHIFT) - 1),
         };
 
         pub fn init(ptr: PtrT, tag: Tag) Self {
@@ -248,12 +236,12 @@ pub fn TaggedPtr(comptime PtrT: type, comptime Tag: type) type {
 
             // Validate alignment requirements
             if (PACKING_METHOD == .Alignment or PACKING_METHOD == .Packed) {
-                assert((ptr_int & LOW_TAG_MASK) == 0); // Pointer must be aligned
+                assert((ptr_int & ALIGNMENT_MASK) == 0); // Pointer must be aligned
             }
 
             const value = switch (PACKING_METHOD) {
                 .Alignment => ptr_int | tag_int,
-                .HighBits => ptr_int | (tag_int << HIGH_TAG_SHIFT),
+                .HighBits => ptr_int | (tag_int << HIGH_BIT_SHIFT),
                 .Packed => (ptr_int >> ALIGNMENT_BITS) | (tag_int << PTR_BITS),
             };
 
@@ -280,8 +268,8 @@ pub fn TaggedPtr(comptime PtrT: type, comptime Tag: type) type {
 
         pub fn getTag(self: Self) Tag {
             const tag_bits = switch (PACKING_METHOD) {
-                .Alignment => self.value & LOW_TAG_MASK,
-                .HighBits => (self.value >> HIGH_TAG_SHIFT) & HIGH_TAG_MASK,
+                .Alignment => self.value & ALIGNMENT_MASK,
+                .HighBits => (self.value >> HIGH_BIT_SHIFT),
                 .Packed => (self.value >> PTR_BITS),
             };
             return fromInt(Tag, tag_bits);
@@ -303,8 +291,6 @@ pub fn TaggedPtr(comptime PtrT: type, comptime Tag: type) type {
                 pub const tag_bits = TAG_BITS;
                 pub const alignment_bits = ALIGNMENT_BITS;
                 pub const high_bits = HIGH_BITS;
-                pub const low_tag_bits = if (PACKING_METHOD == .Packed) LOW_TAG_BITS else if (PACKING_METHOD == .Alignment) TAG_BITS else 0;
-                pub const high_tag_bits = if (PACKING_METHOD == .Packed) HIGH_TAG_BITS else if (PACKING_METHOD == .HighBits) TAG_BITS else 0;
                 pub const max_tag_value = (@as(usize, 1) << TAG_BITS) - 1;
             };
         }
