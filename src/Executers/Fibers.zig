@@ -277,6 +277,9 @@ const Task = union(enum) {
 
 /// A single fiber, with its own stack and saved context.
 const Fiber = struct {
+    ctx: Context,
+    stack: []usize,
+
     /// Initialize a Fiber: alloc a stack, set up a context that will
     fn init(
         allocator: std.mem.Allocator,
