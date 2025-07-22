@@ -11,29 +11,17 @@ vtable: *const VTable,
 
 io: Io,
 
-pub const Cancelable = error{
-    /// Caller has requested the async operation to stop.
-    Canceled,
+pub const AnyFuture = struct {
+    start: *const fn (arg: *anyopaque) void,
+    arg: *anyopaque,
 };
 
 pub const VTable = struct {
-    @"async": *const fn (
-        ctx: ?*anyopaque,
-        /// The pointer of this slice is an "eager" result value.
-        /// The length is the size in bytes of the result type.
-        /// This pointer's lifetime expires directly after the call to this function.
-        result: []u8,
-        result_alignment: std.mem.Alignment,
-        /// Copied and then passed to `start`.
-        context: []const u8,
-        context_alignment: std.mem.Alignment,
-        start: *const fn (context: *const anyopaque, result: *anyopaque) void,
-    ) ?*AnyFuture,
     /// runtimeutes `start` asynchronously in a manner such that it cleans itself
     /// up. This mode does not support results, await, or cancel.
     ///
     /// Thread-safe.
-    asyncDetached: *const fn (
+    spawn: *const fn (
         /// Corresponds to `runtime.ctx`.
         ctx: ?*anyopaque,
         /// Copied and then passed to `start`.
@@ -41,36 +29,20 @@ pub const VTable = struct {
         context_alignment: std.mem.Alignment,
         start: *const fn (context: *const anyopaque) void,
     ) void,
-
-    /// This function is only called when `async` returns a non-null value.
+    /// Runs all the futures in parallel, and waits for them all to finish.
     ///
     /// Thread-safe.
-    @"await": *const fn (
-        /// Corresponds to `Io.userdata`.
-        ctx: ?*anyopaque,
-        /// The same value that was returned from `async`.
-        any_future: *AnyFuture,
-        /// Points to a buffer where the result is written.
-        /// The length is equal to size in bytes of result type.
-        result: []u8,
-        result_alignment: std.mem.Alignment,
-    ) void,
+    join: *const fn (ctx: ?*anyopaque, futures: []const AnyFuture) void,
 
-    select: *const fn (ctx: ?*anyopaque, futures: []const *AnyFuture) usize,
+    /// Runs all the futures in parallel, and waits for them all to finish.
+    /// Its possible that two futures finish at the same time, in which case
+    /// the implementation decides which one to return.
+    ///
+    /// Thread-safe.
+    select: *const fn (ctx: ?*anyopaque, futures: []const AnyFuture) usize,
 
     // Suspends this future until Io wakes it up
-    @"suspend": *const fn (ctx: ?*anyopaque) Cancelable!void,
-
-    cancel: *const fn (
-        /// Corresponds to `Runtime.ctx`.
-        ctx: ?*anyopaque,
-        /// The same value that was returned from `async`.
-        any_future: *AnyFuture,
-        /// Points to a buffer where the result is written.
-        /// The length is equal to size in bytes of result type.
-        result: []u8,
-        result_alignment: std.mem.Alignment,
-    ) void,
+    @"suspend": *const fn (ctx: ?*anyopaque) void,
 
     wake: *const fn (ctx: ?*anyopaque, fut: *anyopaque) void,
 
@@ -81,8 +53,7 @@ pub const VTable = struct {
     getLocalContext: *const fn (ctx: ?*anyopaque) ?*anyopaque,
 };
 
-// Returns true if cancled
-pub fn @"suspend"(runtime: Runtime) Cancelable!void {
+pub fn @"suspend"(runtime: Runtime) void {
     return runtime.vtable.@"suspend"(runtime.ctx);
 }
 
@@ -98,36 +69,40 @@ pub fn getLocalContext(runtime: Runtime) ?*anyopaque {
     return runtime.vtable.getLocalContext(runtime.ctx);
 }
 
-pub const AnyFuture = opaque {};
-
-pub fn Future(Result: type) type {
+pub fn Future(comptime Fn: anytype) type {
+    const fn_info = @typeInfo(@TypeOf(Fn)).@"fn";
     return struct {
-        any_future: ?*AnyFuture,
-        result: Result,
+        const Self = @This();
+        result: fn_info.return_type.?,
+        // Maybe async functions get an implcicit frame arguemnt?
+        args: std.meta.ArgsTuple(@TypeOf(Fn)),
 
-        /// Equivalent to `await` but sets a flag observable to application
-        /// code that cancellation has been requested.
-        ///
-        /// Idempotent.
-        pub fn cancel(f: *@This(), runtime: Runtime) Result {
-            const any_future = f.any_future orelse return f.result;
-            runtime.vtable.cancel(runtime.ctx, any_future, @ptrCast((&f.result)[0..1]), std.mem.Alignment.fromByteUnits(@alignOf(Result)));
-            f.any_future = null;
-            return f.result;
+        pub fn init(args: std.meta.ArgsTuple(@TypeOf(Fn))) Self {
+            return .{
+                .args = args,
+                .result = undefined,
+            };
         }
 
-        pub fn @"await"(f: *@This(), runtime: Runtime) Result {
-            const any_future = f.any_future orelse return f.result;
-            runtime.vtable.@"await"(runtime.ctx, any_future, if (@sizeOf(Result) == 0) &.{} else @ptrCast((&f.result)[0..1]), std.mem.Alignment.fromByteUnits(@alignOf(Result)));
-            f.any_future = null;
-            return f.result;
+        pub fn any_future(self: *@This()) AnyFuture {
+            const TypeErased = struct {
+                fn start(arg: *anyopaque) void {
+                    const self_casted: *Self = @alignCast(@ptrCast(arg));
+                    std.log.info("self_casted: {x}", .{@intFromPtr(self_casted)});
+                    self_casted.result = @call(.auto, Fn, self_casted.args);
+                }
+            };
+            return .{
+                .start = @ptrCast(&TypeErased.start),
+                .arg = @ptrCast(self),
+            };
         }
     };
 }
 
 /// Calls `function` with `args` asynchronously. The resource cleans itself up
 /// when the function returns. Does not support await, cancel, or a return value.
-pub inline fn asyncDetached(runtime: Runtime, function: anytype, args: std.meta.ArgsTuple(@TypeOf(function))) void {
+pub inline fn spawn(runtime: Runtime, function: anytype, args: std.meta.ArgsTuple(@TypeOf(function))) void {
     const Args = @TypeOf(args);
     const TypeErased = struct {
         fn start(context: *const anyopaque) void {
@@ -135,40 +110,51 @@ pub inline fn asyncDetached(runtime: Runtime, function: anytype, args: std.meta.
             @call(.auto, function, args_casted.*);
         }
     };
-    runtime.vtable.asyncDetached(runtime.ctx, if (@sizeOf(Args) == 0) &.{} else @ptrCast((&args)[0..1]), std.mem.Alignment.fromByteUnits(@alignOf(Args)), TypeErased.start);
+    runtime.vtable.spawn(runtime.ctx, if (@sizeOf(Args) == 0) &.{} else @ptrCast((&args)[0..1]), std.mem.Alignment.fromByteUnits(@alignOf(Args)), TypeErased.start);
 }
 
-/// Calls `function` with `args`, such that the return value of the function is
-/// not guaranteed to be available until `await` is called.
-pub noinline fn @"async"(runtime: Runtime, function: anytype, args: std.meta.ArgsTuple(@TypeOf(function))) Future(@typeInfo(@TypeOf(function)).@"fn".return_type.?) {
-    const Result = @typeInfo(@TypeOf(function)).@"fn".return_type.?;
-    const Args = @TypeOf(args);
-    const TypeErased = struct {
-        fn start(context: *const anyopaque, result: *anyopaque) void {
-            const args_casted: *const Args = @alignCast(@ptrCast(context));
-            const result_casted: *Result = @ptrCast(@alignCast(result));
-            result_casted.* = @call(.auto, function, args_casted.*);
-        }
-    };
-    var future: Future(Result) = undefined;
+pub fn JoinResult(S: anytype) type {
+    const struct_fields = @typeInfo(S).@"struct".fields;
 
-    const result_buf: []u8 = if (@sizeOf(Result) == 0) &.{} else @ptrCast((&future.result)[0..1]);
-    const result_alignment = std.mem.Alignment.fromByteUnits(@alignOf(Result));
-    const args_buf: []const u8 = if (@sizeOf(Args) == 0) &.{} else @ptrCast((&args)[0..1]);
-    const args_alignment = std.mem.Alignment.fromByteUnits(@alignOf(Args));
-    const start = TypeErased.start;
-    const ctx = runtime.ctx;
-
-    future.any_future = runtime.vtable.@"async"(
-        ctx,
-        result_buf,
-        result_alignment,
-        args_buf,
-        args_alignment,
-        start,
-    );
-    return future;
+    var fields: [struct_fields.len]std.builtin.Type.StructField = undefined;
+    for (&fields, struct_fields) |*field, struct_field| {
+        const F = @typeInfo(struct_field.type).pointer.child;
+        const Result = @TypeOf(@as(F, undefined).result);
+        field.* = .{
+            .name = struct_field.name,
+            .type = Result,
+            .default_value_ptr = null,
+            .is_comptime = false,
+            .alignment = @alignOf(Result),
+        };
+    }
+    return @Type(.{ .@"struct" = .{
+        .layout = .auto,
+        .fields = &fields,
+        .decls = &.{},
+        .is_tuple = false,
+    } });
 }
+
+/// `s` is a struct with every field a `*Future(T)`, where `T` can be any type,
+/// and can be different for each field.
+pub fn join(runtime: Runtime, s: anytype) JoinResult(@TypeOf(s)) {
+    const fields = @typeInfo(@TypeOf(s)).@"struct".fields;
+    var futures: [fields.len]AnyFuture = undefined;
+    inline for (fields, &futures) |field, *any_future| {
+        const future = @field(s, field.name);
+        any_future.* = future.any_future();
+    }
+    runtime.vtable.join(runtime.ctx, &futures);
+
+    var result: JoinResult(@TypeOf(s)) = undefined;
+    inline for (fields) |field| {
+        const future = @field(s, field.name);
+        @field(result, field.name) = future.result;
+    }
+    return result;
+}
+
 /// Given a struct with each field a `*Future`, returns a union with the same
 /// fields, each field type the future's result.
 pub fn SelectUnion(S: type) type {
@@ -197,15 +183,15 @@ pub fn select(runtime: Runtime, s: anytype) SelectUnion(@TypeOf(s)) {
     const U = SelectUnion(@TypeOf(s));
     const S = @TypeOf(s);
     const fields = @typeInfo(S).@"struct".fields;
-    var futures: [fields.len]*AnyFuture = undefined;
+    var futures: [fields.len]AnyFuture = undefined;
     inline for (fields, &futures) |field, *any_future| {
         const future = @field(s, field.name);
-        any_future.* = future.any_future orelse return @unionInit(U, field.name, future.result);
+        any_future.* = future.any_future();
     }
     switch (runtime.vtable.select(runtime.ctx, &futures)) {
         inline 0...(fields.len - 1) => |selected_index| {
             const field_name = fields[selected_index].name;
-            return @unionInit(U, field_name, @field(s, field_name).@"await"(runtime));
+            return @unionInit(U, field_name, @field(s, field_name).result);
         },
         else => unreachable,
     }

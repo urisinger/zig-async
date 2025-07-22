@@ -3,8 +3,6 @@ const Runtime = @import("Runtime.zig");
 
 const fs = std.fs;
 
-const Cancelable = Runtime.Cancelable;
-
 pub const VTable = struct {
     createContext: *const fn (global_ctx: ?*anyopaque) ?*anyopaque,
     destroyContext: *const fn (global_ctx: ?*anyopaque, runtime: Runtime, context: ?*anyopaque) void,
@@ -12,7 +10,7 @@ pub const VTable = struct {
     signalExit: *const fn (global_ctx: ?*anyopaque, runtime: Runtime, signaled_thread: ?*anyopaque) void,
 
     // wake up a thread with a task to run
-    wakeThread: *const fn (global_ctx: ?*anyopaque, runtime: Runtime, other_thread_ctx: ?*anyopaque) void,
+    wakeThread: *const fn (global_ctx: ?*anyopaque, cur_thread_ctx: ?*anyopaque, other_thread_ctx: ?*anyopaque) void,
 
     //createFile: *const fn (global_ctx: ?*anyopaque, runtime: runtime, path: []const u8, flags: File.CreateFlags) File.OpenError!File,
     openFile: *const fn (global_ctx: ?*anyopaque, runtime: Runtime, path: []const u8, flags: File.OpenFlags) File.OpenError!File,
@@ -30,31 +28,31 @@ pub const File = struct {
     pub const OpenFlags = fs.File.OpenFlags;
     pub const CreateFlags = fs.File.CreateFlags;
 
-    pub const OpenError = Cancelable || fs.File.OpenError;
+    pub const OpenError = fs.File.OpenError;
 
     pub fn close(file: File) void {
         return file.runtime.io.vtable.closeFile(file.runtime.io.ctx, file.runtime, file);
     }
 
-    pub const ReadError = Cancelable || fs.File.ReadError;
+    pub const ReadError = fs.File.ReadError;
 
     pub fn read(file: File, buffer: []u8) ReadError!usize {
         return @errorCast(file.pread(buffer, -1));
     }
 
-    pub const PReadError = Cancelable || fs.File.PReadError;
+    pub const PReadError = fs.File.PReadError;
 
     pub fn pread(file: File, buffer: []u8, offset: std.posix.off_t) PReadError!usize {
         return file.runtime.io.vtable.pread(file.runtime.io.ctx, file.runtime, file, buffer, offset);
     }
 
-    pub const WriteError = Cancelable || fs.File.WriteError;
+    pub const WriteError = fs.File.WriteError;
 
     pub fn write(file: File, buffer: []const u8) WriteError!usize {
         return @errorCast(file.pwrite(buffer, -1));
     }
 
-    pub const PWriteError = Cancelable || fs.File.PWriteError;
+    pub const PWriteError = fs.File.PWriteError;
 
     pub fn pwrite(file: File, buffer: []const u8, offset: std.posix.off_t) PWriteError!usize {
         return file.runtime.io.vtable.pwrite(file.runtime.io.ctx, file.runtime, file, buffer, offset);

@@ -1,6 +1,7 @@
 const std = @import("std");
 const log = std.log.scoped(.main);
 const Runtime = @import("Runtime.zig");
+const Future = Runtime.Future;
 const Fibers = @import("Fibers.zig");
 const EventLoop = @import("EventLoop.zig");
 
@@ -39,13 +40,14 @@ pub fn main() !void {
     const allocator = gpa.allocator();
 
     var event_loop = EventLoop.init(gpa.allocator());
-    var fibers = Fibers.init(allocator, event_loop.io());
+    var fibers = try Fibers.init(allocator, event_loop.io());
 
     const rt = fibers.runtime();
 
-    rt.asyncDetached(run, .{rt});
-
-    fibers.join();
+    rt.spawn(run, .{rt});
+    rt.spawn(run, .{rt});
+    rt.spawn(run, .{rt});
+    rt.spawn(run, .{rt});
 
     fibers.deinit();
 
@@ -54,18 +56,23 @@ pub fn main() !void {
 
 pub fn run(rt: Runtime) void {
     log.info("hi", .{});
-    var fut3 = rt.@"async"(run3, .{rt});
+    {
+        var fu1: Future(run1) = .init(.{rt});
+        var fu2: Future(run2) = .init(.{rt});
+        var fu3: Future(run3) = .init(.{rt});
+        const result = rt.join(.{ &fu1, &fu2, &fu3 });
+        log.info("result: {any}", .{result});
+    }
 
-    _ = fut3.cancel(rt);
+    {
+        var fu1: Future(run1) = .init(.{rt});
+        var fu2: Future(run2) = .init(.{rt});
+        var fu3: Future(run3) = .init(.{rt});
+        const result = rt.select(.{ &fu1, &fu2, &fu3 });
+        log.info("result: {}", .{result});
+    }
 
-    var fut2 = rt.@"async"(run1, .{rt});
-
-    var fut1 = rt.@"async"(run2, .{rt});
-
-    _ = fut1.@"await"(rt);
-    _ = fut2.@"await"(rt);
-
-    log.info("i am here", .{});
+    rt.spawn(run4, .{rt});
 
     log.info("main finished", .{});
 }
@@ -109,5 +116,12 @@ pub fn run3(rt: Runtime) usize {
     for (res) |c| {
         log.info("{}", .{c});
     }
+
+    std.log.info("h", .{});
     return read;
+}
+
+pub fn run4(rt: Runtime) void {
+    _ = rt;
+    log.info("future 4 running", .{});
 }
