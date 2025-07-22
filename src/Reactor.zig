@@ -4,12 +4,14 @@ const Runtime = @import("Runtime.zig");
 const fs = std.fs;
 
 pub const VTable = struct {
+    // Create a thread context.
     createContext: *const fn (global_ctx: ?*anyopaque) ?*anyopaque,
+    // Destroy a thread context.
     destroyContext: *const fn (global_ctx: ?*anyopaque, runtime: Runtime, context: ?*anyopaque) void,
     onPark: *const fn (global_ctx: ?*anyopaque, runtime: Runtime) bool,
     signalExit: *const fn (global_ctx: ?*anyopaque, runtime: Runtime, signaled_thread: ?*anyopaque) void,
 
-    // wake up a thread with a task to run
+    // wake up another thread
     wakeThread: *const fn (global_ctx: ?*anyopaque, cur_thread_ctx: ?*anyopaque, other_thread_ctx: ?*anyopaque) void,
 
     //createFile: *const fn (global_ctx: ?*anyopaque, runtime: runtime, path: []const u8, flags: File.CreateFlags) File.OpenError!File,
@@ -31,7 +33,7 @@ pub const File = struct {
     pub const OpenError = fs.File.OpenError;
 
     pub fn close(file: File) void {
-        return file.runtime.io.vtable.closeFile(file.runtime.io.ctx, file.runtime, file);
+        return file.runtime.reactor.vtable.closeFile(file.runtime.reactor.ctx, file.runtime, file);
     }
 
     pub const ReadError = fs.File.ReadError;
@@ -43,7 +45,7 @@ pub const File = struct {
     pub const PReadError = fs.File.PReadError;
 
     pub fn pread(file: File, buffer: []u8, offset: std.posix.off_t) PReadError!usize {
-        return file.runtime.io.vtable.pread(file.runtime.io.ctx, file.runtime, file, buffer, offset);
+        return file.runtime.reactor.vtable.pread(file.runtime.reactor.ctx, file.runtime, file, buffer, offset);
     }
 
     pub const WriteError = fs.File.WriteError;
@@ -55,7 +57,7 @@ pub const File = struct {
     pub const PWriteError = fs.File.PWriteError;
 
     pub fn pwrite(file: File, buffer: []const u8, offset: std.posix.off_t) PWriteError!usize {
-        return file.runtime.io.vtable.pwrite(file.runtime.io.ctx, file.runtime, file, buffer, offset);
+        return file.runtime.reactor.vtable.pwrite(file.runtime.reactor.ctx, file.runtime, file, buffer, offset);
     }
 
     pub fn writeAll(file: File, bytes: []const u8) WriteError!void {

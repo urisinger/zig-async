@@ -2,8 +2,8 @@ const std = @import("std");
 const log = std.log.scoped(.main);
 const Runtime = @import("Runtime.zig");
 const Future = Runtime.Future;
-const Fibers = @import("Fibers.zig");
-const EventLoop = @import("EventLoop.zig");
+const Fibers = @import("Executers/Fibers.zig");
+const EventLoop = @import("Reactors/EventLoop.zig");
 
 pub const std_options: std.Options = .{
     .logFn = logfn,
@@ -40,7 +40,7 @@ pub fn main() !void {
     const allocator = gpa.allocator();
 
     var event_loop = EventLoop.init(gpa.allocator());
-    var fibers = try Fibers.init(allocator, event_loop.io());
+    var fibers = try Fibers.init(allocator, event_loop.reactor());
 
     const rt = fibers.runtime();
 

@@ -1,5 +1,5 @@
 const std = @import("std");
-const Io = @import("Io.zig");
+const Reactor = @import("Reactor.zig");
 const fs = std.fs;
 
 const Runtime = @This();
@@ -9,7 +9,7 @@ const FileHandle = opaque {};
 ctx: ?*anyopaque,
 vtable: *const VTable,
 
-io: Io,
+reactor: Reactor,
 
 pub const AnyFuture = struct {
     start: *const fn (arg: *anyopaque) void,
@@ -50,7 +50,7 @@ pub const VTable = struct {
     getWaker: *const fn (ctx: ?*anyopaque) *anyopaque,
 
     // Get the local context for io
-    getLocalContext: *const fn (ctx: ?*anyopaque) ?*anyopaque,
+    getThreadContext: *const fn (ctx: ?*anyopaque) ?*anyopaque,
 };
 
 pub fn @"suspend"(runtime: Runtime) void {
@@ -65,8 +65,8 @@ pub fn getWaker(runtime: Runtime) *anyopaque {
     return runtime.vtable.getWaker(runtime.ctx);
 }
 
-pub fn getLocalContext(runtime: Runtime) ?*anyopaque {
-    return runtime.vtable.getLocalContext(runtime.ctx);
+pub fn getThreadContext(runtime: Runtime) ?*anyopaque {
+    return runtime.vtable.getThreadContext(runtime.ctx);
 }
 
 pub fn Future(comptime Fn: anytype) type {
@@ -88,7 +88,6 @@ pub fn Future(comptime Fn: anytype) type {
             const TypeErased = struct {
                 fn start(arg: *anyopaque) void {
                     const self_casted: *Self = @alignCast(@ptrCast(arg));
-                    std.log.info("self_casted: {x}", .{@intFromPtr(self_casted)});
                     self_casted.result = @call(.auto, Fn, self_casted.args);
                 }
             };
@@ -197,6 +196,6 @@ pub fn select(runtime: Runtime, s: anytype) SelectUnion(@TypeOf(s)) {
     }
 }
 
-pub fn open(runtime: Runtime, path: []const u8, flags: Io.File.OpenFlags) !Io.File {
-    return runtime.io.vtable.openFile(runtime.io.ctx, runtime, path, flags);
+pub fn open(runtime: Runtime, path: []const u8, flags: Reactor.File.OpenFlags) !Reactor.File {
+    return runtime.reactor.vtable.openFile(runtime.reactor.ctx, runtime, path, flags);
 }

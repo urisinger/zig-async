@@ -1,7 +1,7 @@
 const std = @import("std");
-const Runtime = @import("Runtime.zig");
-const Io = @import("Io.zig");
-const types = @import("types.zig");
+const Runtime = @import("../Runtime.zig");
+const Reactor = @import("../Reactor.zig");
+const types = @import("../utils/types.zig");
 const EitherPtr = types.EitherPtr;
 
 const log = std.log.scoped(.EventLoop);
@@ -75,7 +75,7 @@ const MessageEvent = enum(u2) {
     Noop,
 };
 
-const vtable: Io.VTable = .{
+const vtable: Reactor.VTable = .{
     .createContext = createContext,
     .destroyContext = destroyContext,
     .onPark = onPark,
@@ -87,7 +87,7 @@ const vtable: Io.VTable = .{
     .wakeThread = wakeThread,
 };
 
-pub fn io(el: *EventLoop) Io {
+pub fn reactor(el: *EventLoop) Reactor {
     return .{
         .ctx = el,
         .vtable = &vtable,
@@ -95,7 +95,7 @@ pub fn io(el: *EventLoop) Io {
 }
 
 // Open file asynchronously
-pub fn openFile(ctx: ?*anyopaque, rt: Runtime, path: []const u8, flags: Io.File.OpenFlags) Io.File.OpenError!Io.File {
+pub fn openFile(ctx: ?*anyopaque, rt: Runtime, path: []const u8, flags: Reactor.File.OpenFlags) Reactor.File.OpenError!Reactor.File {
     _ = ctx;
     var os_flags: std.posix.O = .{
         .ACCMODE = switch (flags.mode) {
@@ -118,9 +118,9 @@ pub fn openFile(ctx: ?*anyopaque, rt: Runtime, path: []const u8, flags: Io.File.
 }
 
 // Async file read
-pub fn pread(ctx: ?*anyopaque, rt: Runtime, file: Io.File, buffer: []u8, offset: std.posix.off_t) Io.File.PReadError!usize {
+pub fn pread(ctx: ?*anyopaque, rt: Runtime, file: Reactor.File, buffer: []u8, offset: std.posix.off_t) Reactor.File.PReadError!usize {
     _ = ctx;
-    const thread_ctx: *ThreadContext = @alignCast(@ptrCast(rt.getLocalContext()));
+    const thread_ctx: *ThreadContext = @alignCast(@ptrCast(rt.getThreadContext()));
 
     // Create read operation
     var read_op: Operation = .{
@@ -156,9 +156,9 @@ pub fn pread(ctx: ?*anyopaque, rt: Runtime, file: Io.File, buffer: []u8, offset:
 }
 
 // Async file write
-pub fn pwrite(ctx: ?*anyopaque, rt: Runtime, file: Io.File, buffer: []const u8, offset: std.posix.off_t) Io.File.PWriteError!usize {
+pub fn pwrite(ctx: ?*anyopaque, rt: Runtime, file: Reactor.File, buffer: []const u8, offset: std.posix.off_t) Reactor.File.PWriteError!usize {
     _ = ctx;
-    const thread_ctx: *ThreadContext = @alignCast(@ptrCast(rt.getLocalContext()));
+    const thread_ctx: *ThreadContext = @alignCast(@ptrCast(rt.getThreadContext()));
 
     var write_op: Operation = .{
         .waker = rt.getWaker(),
@@ -201,7 +201,7 @@ pub fn pwrite(ctx: ?*anyopaque, rt: Runtime, file: Io.File, buffer: []const u8, 
 }
 
 // Close file
-pub fn closeFile(ctx: ?*anyopaque, rt: Runtime, file: Io.File) void {
+pub fn closeFile(ctx: ?*anyopaque, rt: Runtime, file: Reactor.File) void {
     _ = ctx;
     _ = rt;
     std.posix.close(file.handle);
@@ -234,7 +234,7 @@ fn wakeThread(global_ctx: ?*anyopaque, cur_thread_ctx: ?*anyopaque, other_thread
 fn signalExit(global_ctx: ?*anyopaque, rt: Runtime, thread_ctx: ?*anyopaque) void {
     _ = global_ctx;
     const other_thread: *ThreadContext = @alignCast(@ptrCast(thread_ctx));
-    const cur_thread: *ThreadContext = @alignCast(@ptrCast(rt.getLocalContext()));
+    const cur_thread: *ThreadContext = @alignCast(@ptrCast(rt.getThreadContext()));
 
     std.log.info("signalExit", .{});
 
@@ -251,7 +251,7 @@ fn onPark(global_ctx: ?*anyopaque, rt: Runtime) bool {
     while (true) {
         const event_loop: *EventLoop = @alignCast(@ptrCast(global_ctx));
         _ = event_loop;
-        const thread_ctx: *ThreadContext = @alignCast(@ptrCast(rt.getLocalContext()));
+        const thread_ctx: *ThreadContext = @alignCast(@ptrCast(rt.getThreadContext()));
 
         const io_uring = &thread_ctx.io_uring;
 
@@ -312,6 +312,7 @@ fn onPark(global_ctx: ?*anyopaque, rt: Runtime) bool {
         }
 
         if (noop_count == completed) {
+            log.info("noop_count == completed", .{});
             continue;
         }
         break;

@@ -1,9 +1,10 @@
 const std = @import("std");
 const builtin = @import("builtin");
-const Runtime = @import("Runtime.zig");
-const Io = @import("Io.zig");
-const types = @import("types.zig");
-const EitherPtr = types.EitherPtr;
+const root = @import("root");
+
+const Runtime = @import("../Runtime.zig");
+const Reactor = @import("../Reactor.zig");
+const types = @import("../utils/types.zig");
 
 const log = std.log.scoped(.Fibers);
 const assert = std.debug.assert;
@@ -26,7 +27,7 @@ detached_tasks: struct {
     list: std.ArrayList(*DetachedTask),
 },
 
-io: Io,
+reactor: Reactor,
 const vtable: Runtime.VTable = .{
     .spawn = spawn,
     .@"suspend" = @"suspend",
@@ -34,10 +35,10 @@ const vtable: Runtime.VTable = .{
     .join = join,
     .wake = wake,
     .getWaker = getWaker,
-    .getLocalContext = getLocalContext,
+    .getThreadContext = getThreadContext,
 };
 
-pub fn init(allocator: std.mem.Allocator, io: Io) !*Fibers {
+pub fn init(allocator: std.mem.Allocator, reactor: Reactor) !*Fibers {
     const cpu_count = std.Thread.getCpuCount() catch 1;
     const threads = try allocator.alloc(Thread, cpu_count);
 
@@ -57,7 +58,7 @@ pub fn init(allocator: std.mem.Allocator, io: Io) !*Fibers {
             .list = .init(allocator),
         },
 
-        .io = io,
+        .reactor = reactor,
     };
 
     var thread_id: usize = 0;
@@ -93,7 +94,7 @@ pub fn runtime(self: *Fibers) Runtime {
     return .{
         .vtable = &vtable,
         .ctx = @ptrCast(self),
-        .io = self.io,
+        .reactor = self.reactor,
     };
 }
 
@@ -148,7 +149,7 @@ fn schedule(rt: *Fibers, task: *DetachedTask) void {
         log.info("pushing to free thread", .{});
         thread.push(task);
 
-        rt.io.vtable.wakeThread(rt.io.ctx, if (Thread.self) |self| self.io_ctx else null, @ptrCast(thread.io_ctx));
+        rt.reactor.vtable.wakeThread(rt.reactor.ctx, if (Thread.self) |self| self.io_ctx else null, @ptrCast(thread.io_ctx));
     } else if (Thread.self) |t| {
         log.info("pushing to current thread", .{});
         t.push(task);
@@ -279,7 +280,7 @@ const Thread = struct {
         thread.ready_queue = .init(rt.allocator);
         thread.current_task = null;
         thread.idle_context = .{};
-        thread.io_ctx = rt.io.vtable.createContext(rt.io.ctx);
+        thread.io_ctx = rt.reactor.vtable.createContext(rt.reactor.ctx);
         thread.thread_id = thread_id;
         thread.current_task = task;
 
@@ -313,12 +314,12 @@ const Thread = struct {
             }
             rt.free_threads.mutex.unlock();
             thread.current_task = null;
-            if (rt.io.vtable.onPark(rt.io.ctx, rt.runtime())) {
+            if (rt.reactor.vtable.onPark(rt.reactor.ctx, rt.runtime())) {
                 break;
             }
         }
 
-        rt.io.vtable.destroyContext(rt.io.ctx, rt.runtime(), thread.io_ctx);
+        rt.reactor.vtable.destroyContext(rt.reactor.ctx, rt.runtime(), thread.io_ctx);
 
         // After we get the exit signal, there are no tasks that can accsess our queue
         thread.ready_mutex.lock();
@@ -341,7 +342,7 @@ fn getWaker(ctx: ?*anyopaque) *anyopaque {
     return @ptrCast(Thread.current().current_task.?);
 }
 
-fn getLocalContext(ctx: ?*anyopaque) ?*anyopaque {
+fn getThreadContext(ctx: ?*anyopaque) ?*anyopaque {
     _ = ctx;
     return Thread.current().io_ctx;
 }
