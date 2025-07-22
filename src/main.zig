@@ -5,35 +5,6 @@ const Future = Runtime.Future;
 const Fibers = @import("Executers/Fibers.zig");
 const EventLoop = @import("Reactors/EventLoop.zig");
 
-pub const std_options: std.Options = .{
-    .logFn = logfn,
-};
-
-fn formatTimestamp(timestamp: u64, buf: []u8) []u8 {
-    const ms_in_day = 24 * 60 * 60 * 1000;
-    const ms_in_hour = 60 * 60 * 1000;
-    const ms_in_minute = 60 * 1000;
-
-    const ms_today = timestamp % ms_in_day;
-    const hours = ms_today / ms_in_hour;
-    const minutes = (ms_today % ms_in_hour) / ms_in_minute;
-    const seconds = (ms_today % ms_in_minute) / 1000;
-    const milliseconds = ms_today % 1000;
-
-    return std.fmt.bufPrint(buf, "{:02}:{:02}:{:02}.{:03}", .{ hours, minutes, seconds, milliseconds }) catch "00:00:00.000";
-}
-
-fn logfn(
-    comptime level: std.log.Level,
-    comptime scope: @Type(.enum_literal),
-    comptime format: []const u8,
-    args: anytype,
-) void {
-    const thread_id = std.Thread.getCurrentId();
-
-    std.log.defaultLog(level, scope, "Thread id: {d} " ++ format, .{thread_id} ++ args);
-}
-
 pub fn main() !void {
     var gpa: std.heap.DebugAllocator(.{}) = .init;
 
@@ -44,6 +15,7 @@ pub fn main() !void {
 
     const rt = fibers.runtime();
 
+    rt.spawn(run, .{rt});
     rt.spawn(run, .{rt});
     rt.spawn(run, .{rt});
     rt.spawn(run, .{rt});

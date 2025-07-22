@@ -71,7 +71,6 @@ const Message = EitherPtr(*Operation, MessageEvent);
 
 const MessageEvent = enum(u2) {
     Wake,
-    Exit,
     Noop,
 };
 
@@ -79,7 +78,6 @@ const vtable: Reactor.VTable = .{
     .createContext = createContext,
     .destroyContext = destroyContext,
     .onPark = onPark,
-    .signalExit = signalExit,
     .openFile = openFile,
     .closeFile = closeFile,
     .pread = pread,
@@ -95,7 +93,7 @@ pub fn reactor(el: *EventLoop) Reactor {
 }
 
 // Open file asynchronously
-pub fn openFile(ctx: ?*anyopaque, rt: Runtime, path: []const u8, flags: Reactor.File.OpenFlags) Reactor.File.OpenError!Reactor.File {
+pub fn openFile(ctx: ?*anyopaque, rt: Runtime, path: []const u8, flags: Runtime.File.OpenFlags) Runtime.File.OpenError!Runtime.File {
     _ = ctx;
     var os_flags: std.posix.O = .{
         .ACCMODE = switch (flags.mode) {
@@ -118,7 +116,7 @@ pub fn openFile(ctx: ?*anyopaque, rt: Runtime, path: []const u8, flags: Reactor.
 }
 
 // Async file read
-pub fn pread(ctx: ?*anyopaque, rt: Runtime, file: Reactor.File, buffer: []u8, offset: std.posix.off_t) Reactor.File.PReadError!usize {
+pub fn pread(ctx: ?*anyopaque, rt: Runtime, file: Runtime.File, buffer: []u8, offset: std.posix.off_t) Runtime.File.PReadError!usize {
     _ = ctx;
     const thread_ctx: *ThreadContext = @alignCast(@ptrCast(rt.getThreadContext()));
 
@@ -156,7 +154,7 @@ pub fn pread(ctx: ?*anyopaque, rt: Runtime, file: Reactor.File, buffer: []u8, of
 }
 
 // Async file write
-pub fn pwrite(ctx: ?*anyopaque, rt: Runtime, file: Reactor.File, buffer: []const u8, offset: std.posix.off_t) Reactor.File.PWriteError!usize {
+pub fn pwrite(ctx: ?*anyopaque, rt: Runtime, file: Runtime.File, buffer: []const u8, offset: std.posix.off_t) Runtime.File.PWriteError!usize {
     _ = ctx;
     const thread_ctx: *ThreadContext = @alignCast(@ptrCast(rt.getThreadContext()));
 
@@ -201,7 +199,7 @@ pub fn pwrite(ctx: ?*anyopaque, rt: Runtime, file: Reactor.File, buffer: []const
 }
 
 // Close file
-pub fn closeFile(ctx: ?*anyopaque, rt: Runtime, file: Reactor.File) void {
+pub fn closeFile(ctx: ?*anyopaque, rt: Runtime, file: Runtime.File) void {
     _ = ctx;
     _ = rt;
     std.posix.close(file.handle);
@@ -231,23 +229,7 @@ fn wakeThread(global_ctx: ?*anyopaque, cur_thread_ctx: ?*anyopaque, other_thread
     }
 }
 
-fn signalExit(global_ctx: ?*anyopaque, rt: Runtime, thread_ctx: ?*anyopaque) void {
-    _ = global_ctx;
-    const other_thread: *ThreadContext = @alignCast(@ptrCast(thread_ctx));
-    const cur_thread: *ThreadContext = @alignCast(@ptrCast(rt.getThreadContext()));
-
-    std.log.info("signalExit", .{});
-
-    const sqe = cur_thread.io_uring.get_sqe() catch {
-        @panic("failed to get sqe");
-    };
-    const message = Message.initValue(.Exit);
-    sqe.prep_rw(.MSG_RING, other_thread.io_uring.fd, 0, 0, message.toInner());
-    sqe.user_data = Message.initValue(.Noop).toInner();
-}
-
-// Should exit
-fn onPark(global_ctx: ?*anyopaque, rt: Runtime) bool {
+fn onPark(global_ctx: ?*anyopaque, rt: Runtime) void {
     while (true) {
         const event_loop: *EventLoop = @alignCast(@ptrCast(global_ctx));
         _ = event_loop;
@@ -292,9 +274,6 @@ fn onPark(global_ctx: ?*anyopaque, rt: Runtime) bool {
                         .Wake => {
                             continue;
                         },
-                        .Exit => {
-                            return true;
-                        },
                         .Noop => {
                             noop_count += 1;
                         },
@@ -315,10 +294,9 @@ fn onPark(global_ctx: ?*anyopaque, rt: Runtime) bool {
             log.info("noop_count == completed", .{});
             continue;
         }
+
         break;
     }
-
-    return false;
 }
 
 fn errno(signed: i32) std.posix.E {

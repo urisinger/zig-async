@@ -9,8 +9,6 @@ const FileHandle = opaque {};
 ctx: ?*anyopaque,
 vtable: *const VTable,
 
-reactor: Reactor,
-
 pub const AnyFuture = struct {
     start: *const fn (arg: *anyopaque) void,
     arg: *anyopaque,
@@ -51,6 +49,68 @@ pub const VTable = struct {
 
     // Get the local context for io
     getThreadContext: *const fn (ctx: ?*anyopaque) ?*anyopaque,
+
+    openFile: *const fn (ctx: ?*anyopaque, path: []const u8, flags: File.OpenFlags) File.OpenError!File,
+    closeFile: *const fn (ctx: ?*anyopaque, file: File) void,
+    pread: *const fn (ctx: ?*anyopaque, file: File, buffer: []u8, offset: std.posix.off_t) File.PReadError!usize,
+    pwrite: *const fn (ctx: ?*anyopaque, file: File, buffer: []const u8, offset: std.posix.off_t) File.PWriteError!usize,
+};
+
+pub const File = struct {
+    handle: Handle,
+    runtime: Runtime,
+
+    pub const Handle = std.posix.fd_t;
+
+    pub const OpenFlags = fs.File.OpenFlags;
+    pub const CreateFlags = fs.File.CreateFlags;
+
+    pub const OpenError = fs.File.OpenError;
+
+    pub fn close(file: File) void {
+        return file.runtime.vtable.closeFile(file.runtime.ctx, file);
+    }
+
+    pub const ReadError = fs.File.ReadError;
+
+    pub fn read(file: File, buffer: []u8) ReadError!usize {
+        return @errorCast(file.pread(buffer, -1));
+    }
+
+    pub const PReadError = fs.File.PReadError;
+
+    pub fn pread(file: File, buffer: []u8, offset: std.posix.off_t) PReadError!usize {
+        return file.runtime.vtable.pread(file.runtime.ctx, file, buffer, offset);
+    }
+
+    pub const WriteError = fs.File.WriteError;
+
+    pub fn write(file: File, buffer: []const u8) WriteError!usize {
+        return @errorCast(file.pwrite(buffer, -1));
+    }
+
+    pub const PWriteError = fs.File.PWriteError;
+
+    pub fn pwrite(file: File, buffer: []const u8, offset: std.posix.off_t) PWriteError!usize {
+        return file.runtime.vtable.pwrite(file.runtime.ctx, file.runtime, file, buffer, offset);
+    }
+
+    pub fn writeAll(file: File, bytes: []const u8) WriteError!void {
+        var index: usize = 0;
+        while (index < bytes.len) {
+            index += try file.write(bytes[index..]);
+        }
+    }
+
+    pub fn readAll(file: File, buffer: []u8) ReadError!usize {
+        var index: usize = 0;
+        while (index != buffer.len) {
+            const amt = try file.read(buffer[index..]);
+            if (amt == 0) break;
+            index += amt;
+        }
+        return index;
+    }
 };
 
 pub fn @"suspend"(runtime: Runtime) void {
@@ -196,6 +256,6 @@ pub fn select(runtime: Runtime, s: anytype) SelectUnion(@TypeOf(s)) {
     }
 }
 
-pub fn open(runtime: Runtime, path: []const u8, flags: Reactor.File.OpenFlags) !Reactor.File {
-    return runtime.reactor.vtable.openFile(runtime.reactor.ctx, runtime, path, flags);
+pub fn open(runtime: Runtime, path: []const u8, flags: File.OpenFlags) !File {
+    return runtime.vtable.openFile(runtime.ctx, path, flags);
 }

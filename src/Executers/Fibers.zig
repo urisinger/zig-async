@@ -24,7 +24,15 @@ free_threads: struct {
 
 detached_tasks: struct {
     mutex: std.Thread.Mutex,
-    list: std.ArrayList(*DetachedTask),
+    list: std.ArrayList(*Task.Detached),
+},
+
+shutdown: struct {
+    task_count: std.atomic.Value(usize),
+    requested: std.atomic.Value(bool),
+
+    cond: std.Thread.Condition,
+    mutex: std.Thread.Mutex,
 },
 
 reactor: Reactor,
@@ -36,6 +44,10 @@ const vtable: Runtime.VTable = .{
     .wake = wake,
     .getWaker = getWaker,
     .getThreadContext = getThreadContext,
+    .openFile = openFile,
+    .closeFile = closeFile,
+    .pread = pread,
+    .pwrite = pwrite,
 };
 
 pub fn init(allocator: std.mem.Allocator, reactor: Reactor) !*Fibers {
@@ -59,6 +71,14 @@ pub fn init(allocator: std.mem.Allocator, reactor: Reactor) !*Fibers {
         },
 
         .reactor = reactor,
+
+        .shutdown = .{
+            .task_count = .init(0),
+            .requested = .init(false),
+
+            .cond = .{},
+            .mutex = .{},
+        },
     };
 
     var thread_id: usize = 0;
@@ -74,9 +94,22 @@ pub fn init(allocator: std.mem.Allocator, reactor: Reactor) !*Fibers {
 }
 
 pub fn deinit(self: *Fibers) void {
+    // Signal shutdown to all threads
+
+    self.shutdown.requested.store(true, .release);
+
+    self.shutdown.mutex.lock();
+    self.shutdown.cond.wait(&self.shutdown.mutex);
+    self.shutdown.mutex.unlock();
+
+    // Wake up all threads so they can see the shutdown signal
+    for (self.threads) |*thread| {
+        self.reactor.vtable.wakeThread(self.reactor.ctx, null, thread.io_ctx);
+    }
+
+    // Now join all threads
     for (self.threads) |thread| {
         thread.handle.join();
-        std.log.info("joined thread", .{});
     }
 
     self.free_threads.list.deinit();
@@ -94,7 +127,6 @@ pub fn runtime(self: *Fibers) Runtime {
     return .{
         .vtable = &vtable,
         .ctx = @ptrCast(self),
-        .reactor = self.reactor,
     };
 }
 
@@ -116,7 +148,6 @@ const Context = switch (builtin.cpu.arch) {
 };
 
 fn contextSwitch(old_ctx: *Context, new_ctx: *const Context) void {
-    std.log.info("conext switching: old_stack: {x}, new_stack: {x}, old_ctx: {x}, new_ctx: {x}", .{ old_ctx.rsp, new_ctx.rsp, @intFromPtr(old_ctx), @intFromPtr(new_ctx) });
     switch (builtin.cpu.arch) {
         .x86_64 => asm volatile (
         // Save current context
@@ -136,11 +167,11 @@ fn contextSwitch(old_ctx: *Context, new_ctx: *const Context) void {
         ),
         else => |arch| @compileError("unimplemented architecture: " ++ @tagName(arch)),
     }
-    std.log.info("conext switched back: old_stack: {x}, new_stack: {x}, old_ctx: {x}, new_ctx: {x}", .{ old_ctx.rsp, new_ctx.rsp, @intFromPtr(old_ctx), @intFromPtr(new_ctx) });
 }
 
-fn schedule(rt: *Fibers, task: *DetachedTask) void {
-    std.log.info("scheduling task", .{});
+fn schedule(rt: *Fibers, task: *Task.Detached) void {
+    _ = rt.shutdown.task_count.fetchAdd(1, .acq_rel);
+
     rt.free_threads.mutex.lock();
     const maybe_thread: ?*Thread = rt.free_threads.list.pop();
     rt.free_threads.mutex.unlock();
@@ -160,13 +191,64 @@ fn schedule(rt: *Fibers, task: *DetachedTask) void {
 }
 
 const Task = union(enum) {
-    detached: *DetachedTask,
-    @"async": *AsyncTask,
+    detached: *Detached,
+    @"async": *Async,
 
-    threadlocal var self: ?Task = null;
+    const Detached = struct {
+        fiber: Fiber,
+        start: *const fn (context: *const anyopaque) void,
+        context_buf: []u8,
+        context_alignment: std.mem.Alignment,
+
+        state: std.atomic.Value(TaskState),
+        const TaskState = enum(u8) {
+            Idle,
+            Queued,
+            Running,
+            Completed,
+        };
+
+        fn call(task: *Detached) void {
+            task.start(@ptrCast(task.context_buf.ptr));
+            const thread = Thread.current();
+            const rt = thread.rt;
+            if (rt.shutdown.task_count.fetchSub(1, .acq_rel) == 1) {
+                rt.shutdown.mutex.lock();
+                rt.shutdown.cond.signal();
+                rt.shutdown.mutex.unlock();
+            }
+        }
+
+        fn deinit(task: *Detached, allocator: std.mem.Allocator) void {
+            task.fiber.deinit(allocator);
+            if (task.context_buf.len > 0) {
+                allocator.rawFree(task.context_buf, task.context_alignment, @returnAddress());
+            }
+        }
+    };
+
+    const Async = struct {
+        fiber: Fiber,
+        start: *const fn (arg: *anyopaque) void,
+        arg: *anyopaque,
+
+        waiter: Task,
+        finished: bool = false,
+
+        fn call(task: *Async) void {
+            task.start(task.arg);
+            task.finished = true;
+        }
+
+        fn deinit(task: *Async, allocator: std.mem.Allocator) void {
+            task.fiber.deinit(allocator);
+        }
+    };
+
+    threadlocal var cur: ?Task = null;
 
     fn current() Task {
-        return self.?;
+        return cur.?;
     }
 
     fn fiber(task: Task) *Fiber {
@@ -186,7 +268,7 @@ const Task = union(enum) {
                 contextSwitch(&t.fiber.ctx, &Thread.current().idle_context);
             },
             .@"async" => |t| {
-                self = t.waiter;
+                cur = t.waiter;
                 contextSwitch(&t.fiber.ctx, &t.waiter.fiber().ctx);
             },
         }
@@ -195,9 +277,6 @@ const Task = union(enum) {
 
 /// A single fiber, with its own stack and saved context.
 const Fiber = struct {
-    ctx: Context,
-    stack: []usize,
-
     /// Initialize a Fiber: alloc a stack, set up a context that will
     fn init(
         allocator: std.mem.Allocator,
@@ -244,10 +323,9 @@ const Thread = struct {
 
     io_ctx: ?*anyopaque,
 
-    ready_mutex: std.Thread.Mutex,
-    ready_queue: std.fifo.LinearFifo(*DetachedTask, .Dynamic),
+    ready_queue: std.fifo.LinearFifo(*Task.Detached, .Dynamic),
 
-    current_task: ?*DetachedTask,
+    current_task: ?*Task.Detached,
 
     thread_id: usize,
 
@@ -257,26 +335,23 @@ const Thread = struct {
         return self.?;
     }
 
-    fn push(t: *Thread, task: *DetachedTask) void {
-        t.ready_mutex.lock();
+    // Only push a task to a thread if it is idle!!!
+    fn push(t: *Thread, task: *Task.Detached) void {
         t.ready_queue.writeItem(task) catch unreachable;
-        t.ready_mutex.unlock();
     }
 
-    fn pop(t: *Thread) ?*DetachedTask {
-        t.ready_mutex.lock();
+    // Only the owning thread can pop a task from the queue, we dont steal work here...
+    fn pop(t: *Thread) ?*Task.Detached {
         const task = t.ready_queue.readItem();
-        t.ready_mutex.unlock();
         return task;
     }
 
-    fn entry(rt: *Fibers, thread_id: usize, task: ?*DetachedTask) void {
+    fn entry(rt: *Fibers, thread_id: usize, task: ?*Task.Detached) void {
         // initialize thread, dont touch the handle field
 
         const thread = &rt.threads[thread_id];
 
         thread.rt = rt;
-        thread.ready_mutex = .{};
         thread.ready_queue = .init(rt.allocator);
         thread.current_task = null;
         thread.idle_context = .{};
@@ -294,11 +369,18 @@ const Thread = struct {
             while (thread.pop()) |t| {
                 _ = t.state.cmpxchgStrong(.Queued, .Running, .acq_rel, .acquire);
                 thread.current_task = t;
-                Task.self = .{
+                Task.cur = .{
                     .detached = t,
                 };
                 contextSwitch(&Thread.current().idle_context, &t.fiber.ctx);
                 _ = t.state.cmpxchgStrong(.Running, .Idle, .acq_rel, .acquire);
+            }
+
+            if (rt.shutdown.task_count.load(.acquire) == 0) {
+                if (rt.shutdown.requested.load(.acquire)) {
+                    log.info("shutting down", .{});
+                    break;
+                }
             }
 
             rt.free_threads.mutex.lock();
@@ -312,26 +394,29 @@ const Thread = struct {
                     unreachable;
                 };
             }
-            rt.free_threads.mutex.unlock();
             thread.current_task = null;
-            if (rt.reactor.vtable.onPark(rt.reactor.ctx, rt.runtime())) {
-                break;
+            rt.free_threads.mutex.unlock();
+
+            if (rt.shutdown.task_count.load(.acquire) == 0) {
+                if (rt.shutdown.requested.load(.acquire)) {
+                    log.info("shutting down", .{});
+                    break;
+                }
             }
+            rt.reactor.vtable.onPark(rt.reactor.ctx, rt.runtime());
         }
 
         rt.reactor.vtable.destroyContext(rt.reactor.ctx, rt.runtime(), thread.io_ctx);
 
         // After we get the exit signal, there are no tasks that can accsess our queue
-        thread.ready_mutex.lock();
         thread.ready_queue.deinit();
-        thread.ready_mutex.unlock();
     }
 };
 
 // Places fiber on current thread
 fn wake(ctx: ?*anyopaque, waker: *anyopaque) void {
     _ = ctx;
-    const task: *DetachedTask = @alignCast(@ptrCast(waker));
+    const task: *Task.Detached = @alignCast(@ptrCast(waker));
 
     const t = Thread.current();
     t.push(task);
@@ -353,31 +438,25 @@ fn @"suspend"(ctx: ?*anyopaque) void {
     Task.yeild(Task.current());
 }
 
-const DetachedTask = struct {
-    fiber: Fiber,
-    start: *const fn (context: *const anyopaque) void,
-    context_buf: []u8,
-    context_alignment: std.mem.Alignment,
+fn openFile(ctx: ?*anyopaque, path: []const u8, flags: Runtime.File.OpenFlags) Runtime.File.OpenError!Runtime.File {
+    const rt: *Fibers = @alignCast(@ptrCast(ctx));
+    return rt.reactor.vtable.openFile(rt.reactor.ctx, rt.runtime(), path, flags);
+}
 
-    state: std.atomic.Value(TaskState),
-    const TaskState = enum(u8) {
-        Idle,
-        Queued,
-        Running,
-        Completed,
-    };
+fn closeFile(ctx: ?*anyopaque, file: Runtime.File) void {
+    const rt: *Fibers = @alignCast(@ptrCast(ctx));
+    rt.reactor.vtable.closeFile(rt.reactor.ctx, rt.runtime(), file);
+}
 
-    fn call(self: *DetachedTask) void {
-        self.start(@ptrCast(self.context_buf.ptr));
-    }
+fn pread(ctx: ?*anyopaque, file: Runtime.File, buffer: []u8, offset: std.posix.off_t) Runtime.File.PReadError!usize {
+    const rt: *Fibers = @alignCast(@ptrCast(ctx));
+    return rt.reactor.vtable.pread(rt.reactor.ctx, rt.runtime(), file, buffer, offset);
+}
 
-    fn deinit(self: *DetachedTask, allocator: std.mem.Allocator) void {
-        self.fiber.deinit(allocator);
-        if (self.context_buf.len > 0) {
-            allocator.rawFree(self.context_buf, self.context_alignment, @returnAddress());
-        }
-    }
-};
+fn pwrite(ctx: ?*anyopaque, file: Runtime.File, buffer: []const u8, offset: std.posix.off_t) Runtime.File.PWriteError!usize {
+    const rt: *Fibers = @alignCast(@ptrCast(ctx));
+    return rt.reactor.vtable.pwrite(rt.reactor.ctx, rt.runtime(), file, buffer, offset);
+}
 
 fn spawn(
     ctx: ?*anyopaque,
@@ -394,9 +473,7 @@ fn spawn(
 
     @memcpy(context_buf, context);
 
-    log.info("context_buf: {x}", .{@intFromPtr(context_buf.ptr)});
-
-    const task: *DetachedTask = rt.allocator.create(DetachedTask) catch unreachable;
+    const task: *Task.Detached = rt.allocator.create(Task.Detached) catch unreachable;
 
     task.* = .{
         .fiber = Fiber.init(
@@ -416,25 +493,6 @@ fn spawn(
     rt.schedule(task);
 }
 
-const AsyncTask = struct {
-    fiber: Fiber,
-    start: *const fn (arg: *anyopaque) void,
-    arg: *anyopaque,
-
-    waiter: Task,
-    finished: bool = false,
-
-    fn call(self: *AsyncTask) void {
-        self.start(self.arg);
-        log.info("async task finished", .{});
-        self.finished = true;
-    }
-
-    fn deinit(self: *AsyncTask, allocator: std.mem.Allocator) void {
-        self.fiber.deinit(allocator);
-    }
-};
-
 fn select(
     ctx: ?*anyopaque,
     futures: []const Runtime.AnyFuture,
@@ -442,7 +500,8 @@ fn select(
     const rt: *Fibers = @alignCast(@ptrCast(ctx));
     const me = Task.current();
 
-    const tasks = rt.allocator.alloc(AsyncTask, futures.len) catch unreachable;
+    const tasks = rt.allocator.alloc(Task.Async, futures.len) catch unreachable;
+    defer rt.allocator.free(tasks);
 
     var i: usize = 0;
     for (futures) |afut| {
@@ -461,32 +520,37 @@ fn select(
         i += 1;
     }
 
-    while (true) {
+    const result = outer: while (true) {
         i = 0;
         for (tasks) |*task| {
-            Task.self = .{
+            Task.cur = .{
                 .@"async" = task,
             };
             if (task.finished) {
-                return i;
+                break :outer i;
             }
             contextSwitch(&me.fiber().ctx, &task.fiber.ctx);
             if (task.finished) {
-                return i;
+                break :outer i;
             }
             i += 1;
         }
         Task.yeild(me);
+    };
+
+    for (tasks) |*task| {
+        task.deinit(rt.allocator);
     }
+
+    return result;
 }
 
 fn join(ctx: ?*anyopaque, futures: []const Runtime.AnyFuture) void {
     const rt: *Fibers = @alignCast(@ptrCast(ctx));
     const me = Task.current();
 
-    const tasks = rt.allocator.alloc(AsyncTask, futures.len) catch unreachable;
-
-    log.info("futures.len: {}", .{futures.len});
+    const tasks = rt.allocator.alloc(Task.Async, futures.len) catch unreachable;
+    defer rt.allocator.free(tasks);
 
     var i: usize = 0;
     for (futures) |afut| {
@@ -511,7 +575,7 @@ fn join(ctx: ?*anyopaque, futures: []const Runtime.AnyFuture) void {
         i = 0;
         for (tasks) |*task| {
             if (!task.finished) {
-                Task.self = .{
+                Task.cur = .{
                     .@"async" = task,
                 };
                 contextSwitch(&me.fiber().ctx, &task.fiber.ctx);
@@ -525,15 +589,13 @@ fn join(ctx: ?*anyopaque, futures: []const Runtime.AnyFuture) void {
             break;
         }
 
-        log.info("yeilding", .{});
         Task.yeild(me);
     }
 
-    log.info("all finished", .{});
-
-    for (tasks) |task| {
+    for (tasks) |*task| {
         if (!task.finished) {
             unreachable;
         }
+        task.deinit(rt.allocator);
     }
 }
