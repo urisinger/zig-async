@@ -7,23 +7,17 @@ const EventLoop = @import("Reactors/EventLoop.zig");
 
 pub fn main() !void {
     var gpa: std.heap.DebugAllocator(.{}) = .init;
+    defer std.debug.assert(gpa.deinit() == .ok);
 
     const allocator = gpa.allocator();
 
     var event_loop = EventLoop.init(gpa.allocator());
     var fibers = try Fibers.init(allocator, event_loop.reactor());
+    defer fibers.deinit();
 
     const rt = fibers.runtime();
 
     rt.spawn(run, .{rt});
-    rt.spawn(run, .{rt});
-    rt.spawn(run, .{rt});
-    rt.spawn(run, .{rt});
-    rt.spawn(run, .{rt});
-
-    fibers.deinit();
-
-    log.info("{}", .{gpa.deinit()});
 }
 
 pub fn run(rt: Runtime) void {
@@ -69,9 +63,7 @@ pub fn run3(rt: Runtime) usize {
     const file = rt.open("/dev/random", .{ .mode = .read_only }) catch unreachable;
     var res: [10]u8 = undefined;
     @memset(&res, 1);
-    const read = file.read(
-        &res,
-    ) catch |e| {
+    const read = file.read(rt, &res) catch |e| {
         switch (e) {
             error.Canceled => {
                 log.info("canceled", .{});
@@ -81,7 +73,7 @@ pub fn run3(rt: Runtime) usize {
         }
     };
 
-    file.close();
+    file.close(rt);
 
     log.info("read: {} bytes", .{read});
 

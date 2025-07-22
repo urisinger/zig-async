@@ -31,24 +31,12 @@ pub const VTable = struct {
     ///
     /// Thread-safe.
     join: *const fn (ctx: ?*anyopaque, futures: []const AnyFuture) void,
-
     /// Runs all the futures in parallel, and waits for them all to finish.
     /// Its possible that two futures finish at the same time, in which case
     /// the implementation decides which one to return.
     ///
     /// Thread-safe.
     select: *const fn (ctx: ?*anyopaque, futures: []const AnyFuture) usize,
-
-    // Suspends this future until Io wakes it up
-    @"suspend": *const fn (ctx: ?*anyopaque) void,
-
-    wake: *const fn (ctx: ?*anyopaque, fut: *anyopaque) void,
-
-    // Pass what you get from this to wake yourself
-    getWaker: *const fn (ctx: ?*anyopaque) *anyopaque,
-
-    // Get the local context for io
-    getThreadContext: *const fn (ctx: ?*anyopaque) ?*anyopaque,
 
     openFile: *const fn (ctx: ?*anyopaque, path: []const u8, flags: File.OpenFlags) File.OpenError!File,
     closeFile: *const fn (ctx: ?*anyopaque, file: File) void,
@@ -58,7 +46,6 @@ pub const VTable = struct {
 
 pub const File = struct {
     handle: Handle,
-    runtime: Runtime,
 
     pub const Handle = std.posix.fd_t;
 
@@ -67,67 +54,51 @@ pub const File = struct {
 
     pub const OpenError = fs.File.OpenError;
 
-    pub fn close(file: File) void {
-        return file.runtime.vtable.closeFile(file.runtime.ctx, file);
+    pub fn close(file: File, runtime: Runtime) void {
+        return runtime.vtable.closeFile(runtime.ctx, file);
     }
 
     pub const ReadError = fs.File.ReadError;
 
-    pub fn read(file: File, buffer: []u8) ReadError!usize {
-        return @errorCast(file.pread(buffer, -1));
+    pub fn read(file: File, runtime: Runtime, buffer: []u8) ReadError!usize {
+        return @errorCast(runtime.vtable.pread(runtime.ctx, file, buffer, -1));
     }
 
     pub const PReadError = fs.File.PReadError;
 
-    pub fn pread(file: File, buffer: []u8, offset: std.posix.off_t) PReadError!usize {
-        return file.runtime.vtable.pread(file.runtime.ctx, file, buffer, offset);
+    pub fn pread(file: File, runtime: Runtime, buffer: []u8, offset: std.posix.off_t) PReadError!usize {
+        return runtime.vtable.pread(runtime.ctx, file, buffer, offset);
     }
 
     pub const WriteError = fs.File.WriteError;
 
-    pub fn write(file: File, buffer: []const u8) WriteError!usize {
-        return @errorCast(file.pwrite(buffer, -1));
+    pub fn write(file: File, runtime: Runtime, buffer: []const u8) WriteError!usize {
+        return @errorCast(runtime.vtable.pwrite(runtime.ctx, file, buffer, -1));
     }
 
     pub const PWriteError = fs.File.PWriteError;
 
-    pub fn pwrite(file: File, buffer: []const u8, offset: std.posix.off_t) PWriteError!usize {
-        return file.runtime.vtable.pwrite(file.runtime.ctx, file.runtime, file, buffer, offset);
+    pub fn pwrite(file: File, runtime: Runtime, buffer: []const u8, offset: std.posix.off_t) PWriteError!usize {
+        return runtime.vtable.pwrite(runtime.ctx, file, buffer, offset);
     }
 
-    pub fn writeAll(file: File, bytes: []const u8) WriteError!void {
+    pub fn writeAll(file: File, runtime: Runtime, bytes: []const u8) WriteError!void {
         var index: usize = 0;
         while (index < bytes.len) {
-            index += try file.write(bytes[index..]);
+            index += try runtime.vtable.write(runtime.ctx, file, bytes[index..]);
         }
     }
 
-    pub fn readAll(file: File, buffer: []u8) ReadError!usize {
+    pub fn readAll(file: File, runtime: Runtime, buffer: []u8) ReadError!usize {
         var index: usize = 0;
         while (index != buffer.len) {
-            const amt = try file.read(buffer[index..]);
+            const amt = try file.read(runtime, buffer[index..]);
             if (amt == 0) break;
             index += amt;
         }
         return index;
     }
 };
-
-pub fn @"suspend"(runtime: Runtime) void {
-    return runtime.vtable.@"suspend"(runtime.ctx);
-}
-
-pub fn wake(runtime: Runtime, fut: *anyopaque) void {
-    runtime.vtable.wake(runtime.ctx, fut);
-}
-
-pub fn getWaker(runtime: Runtime) *anyopaque {
-    return runtime.vtable.getWaker(runtime.ctx);
-}
-
-pub fn getThreadContext(runtime: Runtime) ?*anyopaque {
-    return runtime.vtable.getThreadContext(runtime.ctx);
-}
 
 pub fn Future(comptime Fn: anytype) type {
     const fn_info = @typeInfo(@TypeOf(Fn)).@"fn";

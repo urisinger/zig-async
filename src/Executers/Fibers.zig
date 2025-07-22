@@ -36,18 +36,22 @@ shutdown: struct {
 },
 
 reactor: Reactor,
-const vtable: Runtime.VTable = .{
+const rt_vtable: Runtime.VTable = .{
     .spawn = spawn,
-    .@"suspend" = @"suspend",
     .select = select,
     .join = join,
-    .wake = wake,
-    .getWaker = getWaker,
-    .getThreadContext = getThreadContext,
+
     .openFile = openFile,
     .closeFile = closeFile,
     .pread = pread,
     .pwrite = pwrite,
+};
+
+const exec_vtable: Reactor.Executer.VTable = .{
+    .getThreadContext = getThreadContext,
+    .getWaker = getWaker,
+    .wake = wake,
+    .@"suspend" = @"suspend",
 };
 
 pub fn init(allocator: std.mem.Allocator, reactor: Reactor) !*Fibers {
@@ -125,7 +129,14 @@ pub fn deinit(self: *Fibers) void {
 
 pub fn runtime(self: *Fibers) Runtime {
     return .{
-        .vtable = &vtable,
+        .vtable = &rt_vtable,
+        .ctx = @ptrCast(self),
+    };
+}
+
+pub fn executer(self: *Fibers) Reactor.Executer {
+    return .{
+        .vtable = &exec_vtable,
         .ctx = @ptrCast(self),
     };
 }
@@ -406,10 +417,10 @@ const Thread = struct {
                     break;
                 }
             }
-            rt.reactor.vtable.onPark(rt.reactor.ctx, rt.runtime());
+            rt.reactor.vtable.onPark(rt.reactor.ctx, rt.executer());
         }
 
-        rt.reactor.vtable.destroyContext(rt.reactor.ctx, rt.runtime(), thread.io_ctx);
+        rt.reactor.vtable.destroyContext(rt.reactor.ctx, thread.io_ctx);
 
         // After we get the exit signal, there are no tasks that can accsess our queue
         thread.ready_queue.deinit();
@@ -443,22 +454,22 @@ fn @"suspend"(ctx: ?*anyopaque) void {
 
 fn openFile(ctx: ?*anyopaque, path: []const u8, flags: Runtime.File.OpenFlags) Runtime.File.OpenError!Runtime.File {
     const rt: *Fibers = @alignCast(@ptrCast(ctx));
-    return rt.reactor.vtable.openFile(rt.reactor.ctx, rt.runtime(), path, flags);
+    return rt.reactor.vtable.openFile(rt.reactor.ctx, rt.executer(), path, flags);
 }
 
 fn closeFile(ctx: ?*anyopaque, file: Runtime.File) void {
     const rt: *Fibers = @alignCast(@ptrCast(ctx));
-    rt.reactor.vtable.closeFile(rt.reactor.ctx, rt.runtime(), file);
+    rt.reactor.vtable.closeFile(rt.reactor.ctx, rt.executer(), file);
 }
 
 fn pread(ctx: ?*anyopaque, file: Runtime.File, buffer: []u8, offset: std.posix.off_t) Runtime.File.PReadError!usize {
     const rt: *Fibers = @alignCast(@ptrCast(ctx));
-    return rt.reactor.vtable.pread(rt.reactor.ctx, rt.runtime(), file, buffer, offset);
+    return rt.reactor.vtable.pread(rt.reactor.ctx, rt.executer(), file, buffer, offset);
 }
 
 fn pwrite(ctx: ?*anyopaque, file: Runtime.File, buffer: []const u8, offset: std.posix.off_t) Runtime.File.PWriteError!usize {
     const rt: *Fibers = @alignCast(@ptrCast(ctx));
-    return rt.reactor.vtable.pwrite(rt.reactor.ctx, rt.runtime(), file, buffer, offset);
+    return rt.reactor.vtable.pwrite(rt.reactor.ctx, rt.executer(), file, buffer, offset);
 }
 
 fn spawn(

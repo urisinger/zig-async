@@ -45,8 +45,7 @@ pub fn createContext(global_ctx: ?*anyopaque) ?*anyopaque {
     return @ptrCast(thread_ctx);
 }
 
-pub fn destroyContext(global_ctx: ?*anyopaque, runtime: Runtime, context: ?*anyopaque) void {
-    _ = runtime;
+pub fn destroyContext(global_ctx: ?*anyopaque, context: ?*anyopaque) void {
     const event_loop: *EventLoop = @alignCast(@ptrCast(global_ctx));
     const thread_ctx: *ThreadContext = @alignCast(@ptrCast(context));
     thread_ctx.deinit();
@@ -93,8 +92,9 @@ pub fn reactor(el: *EventLoop) Reactor {
 }
 
 // Open file asynchronously
-pub fn openFile(ctx: ?*anyopaque, rt: Runtime, path: []const u8, flags: Runtime.File.OpenFlags) Runtime.File.OpenError!Runtime.File {
+pub fn openFile(ctx: ?*anyopaque, exec: Reactor.Executer, path: []const u8, flags: Runtime.File.OpenFlags) Runtime.File.OpenError!Runtime.File {
     _ = ctx;
+    _ = exec;
     var os_flags: std.posix.O = .{
         .ACCMODE = switch (flags.mode) {
             .read_only => .RDONLY,
@@ -111,18 +111,17 @@ pub fn openFile(ctx: ?*anyopaque, rt: Runtime, path: []const u8, flags: Runtime.
 
     return .{
         .handle = fd,
-        .runtime = rt,
     };
 }
 
 // Async file read
-pub fn pread(ctx: ?*anyopaque, rt: Runtime, file: Runtime.File, buffer: []u8, offset: std.posix.off_t) Runtime.File.PReadError!usize {
+pub fn pread(ctx: ?*anyopaque, exec: Reactor.Executer, file: Runtime.File, buffer: []u8, offset: std.posix.off_t) Runtime.File.PReadError!usize {
     _ = ctx;
-    const thread_ctx: *ThreadContext = @alignCast(@ptrCast(rt.getThreadContext()));
+    const thread_ctx: *ThreadContext = @alignCast(@ptrCast(exec.getThreadContext()));
 
     // Create read operation
     var read_op: Operation = .{
-        .waker = rt.getWaker(),
+        .waker = exec.getWaker(),
         .result = 0,
     };
 
@@ -137,7 +136,7 @@ pub fn pread(ctx: ?*anyopaque, rt: Runtime, file: Runtime.File, buffer: []u8, of
     sqe.user_data = message.toInner();
 
     while (!read_op.has_result) {
-        rt.@"suspend"();
+        exec.@"suspend"();
     }
 
     switch (errno(read_op.result)) {
@@ -154,12 +153,12 @@ pub fn pread(ctx: ?*anyopaque, rt: Runtime, file: Runtime.File, buffer: []u8, of
 }
 
 // Async file write
-pub fn pwrite(ctx: ?*anyopaque, rt: Runtime, file: Runtime.File, buffer: []const u8, offset: std.posix.off_t) Runtime.File.PWriteError!usize {
+pub fn pwrite(ctx: ?*anyopaque, exec: Reactor.Executer, file: Runtime.File, buffer: []const u8, offset: std.posix.off_t) Runtime.File.PWriteError!usize {
     _ = ctx;
-    const thread_ctx: *ThreadContext = @alignCast(@ptrCast(rt.getThreadContext()));
+    const thread_ctx: *ThreadContext = @alignCast(@ptrCast(exec.getThreadContext()));
 
     var write_op: Operation = .{
-        .waker = rt.getWaker(),
+        .waker = exec.getWaker(),
         .result = 0,
     };
 
@@ -174,7 +173,7 @@ pub fn pwrite(ctx: ?*anyopaque, rt: Runtime, file: Runtime.File, buffer: []const
 
     // Suspend until the operation completes
     while (!write_op.has_result) {
-        rt.@"suspend"();
+        exec.@"suspend"();
     }
 
     switch (errno(write_op.result)) {
@@ -199,9 +198,9 @@ pub fn pwrite(ctx: ?*anyopaque, rt: Runtime, file: Runtime.File, buffer: []const
 }
 
 // Close file
-pub fn closeFile(ctx: ?*anyopaque, rt: Runtime, file: Runtime.File) void {
+pub fn closeFile(ctx: ?*anyopaque, exec: Reactor.Executer, file: Runtime.File) void {
     _ = ctx;
-    _ = rt;
+    _ = exec;
     std.posix.close(file.handle);
 }
 
@@ -229,11 +228,11 @@ fn wakeThread(global_ctx: ?*anyopaque, cur_thread_ctx: ?*anyopaque, other_thread
     }
 }
 
-fn onPark(global_ctx: ?*anyopaque, rt: Runtime) void {
+fn onPark(global_ctx: ?*anyopaque, exec: Reactor.Executer) void {
     while (true) {
         const event_loop: *EventLoop = @alignCast(@ptrCast(global_ctx));
         _ = event_loop;
-        const thread_ctx: *ThreadContext = @alignCast(@ptrCast(rt.getThreadContext()));
+        const thread_ctx: *ThreadContext = @alignCast(@ptrCast(exec.getThreadContext()));
 
         const io_uring = &thread_ctx.io_uring;
 
@@ -285,7 +284,7 @@ fn onPark(global_ctx: ?*anyopaque, rt: Runtime) void {
                     op.has_result = true;
 
                     // Wake up the suspended future
-                    rt.wake(op.waker);
+                    exec.wake(op.waker);
                 },
             }
         }
