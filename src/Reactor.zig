@@ -48,6 +48,7 @@ pub const VTable = struct {
     closeFile: *const fn (global_ctx: ?*anyopaque, executer: Executer, File) void,
     pread: *const fn (global_ctx: ?*anyopaque, executer: Executer, file: File, buffer: []u8, offset: std.posix.off_t) File.PReadError!usize,
     pwrite: *const fn (global_ctx: ?*anyopaque, executer: Executer, file: File, buffer: []const u8, offset: std.posix.off_t) File.PWriteError!usize,
+    sleep: *const fn (global_ctx: ?*anyopaque, executer: Executer, timestamp: u64) void,
 };
 ctx: ?*anyopaque,
 

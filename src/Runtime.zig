@@ -42,6 +42,7 @@ pub const VTable = struct {
     closeFile: *const fn (ctx: ?*anyopaque, file: File) void,
     pread: *const fn (ctx: ?*anyopaque, file: File, buffer: []u8, offset: std.posix.off_t) File.PReadError!usize,
     pwrite: *const fn (ctx: ?*anyopaque, file: File, buffer: []const u8, offset: std.posix.off_t) File.PWriteError!usize,
+    sleep: *const fn (ctx: ?*anyopaque, ms: u64) void,
 };
 
 pub const AnySpawnHandle = opaque {};
@@ -202,7 +203,7 @@ pub fn JoinResult(S: anytype) type {
 
 /// `s` is a struct with every field a `*Future(T)`, where `T` can be any type,
 /// and can be different for each field.
-pub fn join(runtime: Runtime, s: anytype) JoinResult(@TypeOf(s)) {
+pub inline fn join(runtime: Runtime, s: anytype) JoinResult(@TypeOf(s)) {
     const fields = @typeInfo(@TypeOf(s)).@"struct".fields;
     var futures: [fields.len]AnyFuture = undefined;
     inline for (fields, &futures) |field, *any_future| {
@@ -243,7 +244,7 @@ pub fn SelectUnion(S: type) type {
 
 /// `s` is a struct with every field a `*Future(T)`, where `T` can be any type,
 /// and can be different for each field.
-pub fn select(runtime: Runtime, s: anytype) SelectUnion(@TypeOf(s)) {
+pub inline fn select(runtime: Runtime, s: anytype) SelectUnion(@TypeOf(s)) {
     const U = SelectUnion(@TypeOf(s));
     const S = @TypeOf(s);
     const fields = @typeInfo(S).@"struct".fields;
@@ -263,4 +264,8 @@ pub fn select(runtime: Runtime, s: anytype) SelectUnion(@TypeOf(s)) {
 
 pub fn open(runtime: Runtime, path: []const u8, flags: File.OpenFlags) !File {
     return runtime.vtable.openFile(runtime.ctx, path, flags);
+}
+
+pub fn sleep(runtime: Runtime, ms: u64) void {
+    runtime.vtable.sleep(runtime.ctx, ms);
 }

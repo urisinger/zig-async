@@ -46,6 +46,7 @@ const rt_vtable: Runtime.VTable = .{
     .closeFile = closeFile,
     .pread = pread,
     .pwrite = pwrite,
+    .sleep = sleep,
 };
 
 const exec_vtable: Reactor.Executer.VTable = .{
@@ -183,8 +184,10 @@ fn contextSwitch(old_ctx: *Context, new_ctx: *const Context) void {
 
 fn reschedule(rt: *Fibers, task: *Task.Detached) void {
     if (task.state.cmpxchgStrong(.Idle, .Queued, .acq_rel, .acquire)) |old_state| {
-        log.info("task already scheduled: {any}", .{old_state});
-        task.rerun.store(true, .release);
+        if (old_state == .Running) {
+            log.info("task already scheduled: {any}", .{old_state});
+            task.rerun.store(true, .release);
+        }
         return;
     }
 
@@ -238,15 +241,20 @@ const Task = union(enum) {
             task.start(@ptrCast(task.context_buf.ptr), @ptrCast(task.result_buf.ptr));
             const thread = Thread.current();
             const rt = thread.rt;
-            if (rt.shutdown.task_count.fetchSub(1, .acq_rel) == 1) {
+
+            _ = task.state.store(.Completed, .release);
+
+            if (task.waiter.load(.acquire)) |w| {
+                rt.reschedule(w);
+            }
+
+            const task_count = rt.shutdown.task_count.fetchSub(1, .acq_rel);
+            log.info("task count: {any}", .{task_count});
+            if (task_count == 1) {
                 log.info("last task finished, signaling shutdown", .{});
                 rt.shutdown.mutex.lock();
                 rt.shutdown.cond.signal();
                 rt.shutdown.mutex.unlock();
-            }
-            _ = task.state.cmpxchgStrong(.Running, .Completed, .acq_rel, .acquire);
-            if (task.waiter.load(.acquire)) |w| {
-                rt.reschedule(w);
             }
         }
 
@@ -384,7 +392,9 @@ const Thread = struct {
 
     // Only the owning thread can pop a task from the queue, we dont steal work here...
     fn pop(t: *Thread) ?*Task.Detached {
+        t.ready_mutex.lock();
         const task = t.ready_queue.readItem();
+        t.ready_mutex.unlock();
         return task;
     }
 
@@ -416,8 +426,10 @@ const Thread = struct {
                 const new_state = t.state.cmpxchgStrong(.Running, .Idle, .acq_rel, .acquire);
                 log.info("task finished: {any}", .{new_state});
 
-                if (t.rerun.load(.acquire)) {
-                    rt.schedule(t);
+                if (t.rerun.swap(false, .acq_rel) and new_state != .Completed) {
+                    log.info("rerunning task", .{});
+                    t.state.store(.Queued, .release);
+                    thread.push(t);
                 }
             }
 
@@ -503,6 +515,11 @@ fn pread(ctx: ?*anyopaque, file: Runtime.File, buffer: []u8, offset: std.posix.o
 fn pwrite(ctx: ?*anyopaque, file: Runtime.File, buffer: []const u8, offset: std.posix.off_t) Runtime.File.PWriteError!usize {
     const rt: *Fibers = @alignCast(@ptrCast(ctx));
     return rt.reactor.vtable.pwrite(rt.reactor.ctx, rt.executer(), file, buffer, offset);
+}
+
+fn sleep(ctx: ?*anyopaque, ms: u64) void {
+    const rt: *Fibers = @alignCast(@ptrCast(ctx));
+    rt.reactor.vtable.sleep(rt.reactor.ctx, rt.executer(), ms);
 }
 
 fn spawn(

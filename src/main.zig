@@ -47,8 +47,11 @@ pub fn run(rt: Runtime) i32 {
 }
 
 pub fn run1(rt: Runtime) i32 {
-    _ = rt;
     log.info("future 1 running", .{});
+    const handle1 = rt.spawn(run2, .{rt});
+    const handle2 = rt.spawn(run3, .{rt});
+    _ = handle1.join(rt);
+    _ = handle2.join(rt);
 
     return 1;
 }
@@ -56,6 +59,8 @@ pub fn run1(rt: Runtime) i32 {
 pub fn run2(rt: Runtime) i32 {
     _ = rt;
     log.info("future 2 running", .{});
+
+    log.info("future 2 done", .{});
 
     return 2;
 }
@@ -66,23 +71,11 @@ pub fn run3(rt: Runtime) usize {
     const file = rt.open("/dev/random", .{ .mode = .read_only }) catch unreachable;
     var res: [10]u8 = undefined;
     @memset(&res, 1);
-    const read = file.read(rt, &res) catch |e| {
-        switch (e) {
-            error.Canceled => {
-                log.info("canceled", .{});
-                return 0;
-            },
-            else => return 0,
-        }
-    };
+    const read = file.read(rt, &res) catch return 0;
 
     file.close(rt);
 
     log.info("read: {} bytes", .{read});
-
-    for (res) |c| {
-        log.info("{}", .{c});
-    }
 
     std.log.info("h", .{});
     return read;

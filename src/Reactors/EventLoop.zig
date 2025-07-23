@@ -82,6 +82,7 @@ const vtable: Reactor.VTable = .{
     .pread = pread,
     .pwrite = pwrite,
     .wakeThread = wakeThread,
+    .sleep = sleep,
 };
 
 pub fn reactor(el: *EventLoop) Reactor {
@@ -204,6 +205,44 @@ pub fn closeFile(ctx: ?*anyopaque, exec: Reactor.Executer, file: Runtime.File) v
     std.posix.close(file.handle);
 }
 
+fn sleep(ctx: ?*anyopaque, exec: Reactor.Executer, ms: u64) void {
+    _ = ctx;
+
+    const thread_ctx: *ThreadContext = @alignCast(@ptrCast(exec.getThreadContext()));
+
+    const timeout_sqe = thread_ctx.io_uring.get_sqe() catch {
+        @panic("failed to get sqe");
+    };
+
+    var timeout_op: Operation = .{
+        .waker = exec.getWaker(),
+        .result = 0,
+        .has_result = false,
+    };
+    const timeout_message = Message.initPtr(&timeout_op);
+    var ts: std.os.linux.kernel_timespec = .{
+        .sec = @intCast(ms / 1000),
+        .nsec = @intCast((ms % 1000) * 1000000),
+    };
+    timeout_sqe.prep_timeout(&ts, 1, 0);
+    timeout_sqe.user_data = timeout_message.toInner();
+
+    while (!timeout_op.has_result) {
+        log.info("sleeping", .{});
+        exec.@"suspend"();
+        switch (errno(timeout_op.result)) {
+            .SUCCESS => {},
+            .TIME => {
+                break;
+            },
+            else => |err| {
+                log.err("sleep failed: {any}", .{err});
+                unreachable;
+            },
+        }
+    }
+}
+
 fn wakeThread(global_ctx: ?*anyopaque, cur_thread_ctx: ?*anyopaque, other_thread_ctx: ?*anyopaque) void {
     _ = global_ctx;
     log.info("wakeThread", .{});
@@ -218,6 +257,7 @@ fn wakeThread(global_ctx: ?*anyopaque, cur_thread_ctx: ?*anyopaque, other_thread
         const message = Message.initValue(.Wake);
 
         sqe.prep_rw(.MSG_RING, other_thread.io_uring.fd, 0, 0, message.toInner());
+        sqe.user_data = Message.initValue(.Noop).toInner();
     } else {
         const other_thread: *ThreadContext = @alignCast(@ptrCast(other_thread_ctx));
 
@@ -246,7 +286,7 @@ fn onPark(global_ctx: ?*anyopaque, exec: Reactor.Executer) void {
         sqe.user_data = Message.initValue(.Wake).toInner();
 
         // Submit pending operations and wait for at least one completion
-        _ = thread_ctx.io_uring.submit_and_wait(1) catch unreachable;
+        _ = thread_ctx.io_uring.submit() catch unreachable;
 
         // Wait for completion events
         var cqes: [io_uring_entries]std.os.linux.io_uring_cqe = undefined;
@@ -261,8 +301,9 @@ fn onPark(global_ctx: ?*anyopaque, exec: Reactor.Executer) void {
         // Process completed operations
         for (cqes[0..completed]) |cqe| {
             if (cqe.user_data == 0) {
+                log.info("noop: {any}", .{cqe});
                 noop_count += 1;
-                continue;
+                unreachable;
             }
 
             const message = Message.fromValue(@as(usize, cqe.user_data));
@@ -282,7 +323,6 @@ fn onPark(global_ctx: ?*anyopaque, exec: Reactor.Executer) void {
                     // Set the result based on the completion event
                     op.result = cqe.res;
                     op.has_result = true;
-
                     // Wake up the suspended future
                     exec.wake(op.waker);
                 },
@@ -298,6 +338,6 @@ fn onPark(global_ctx: ?*anyopaque, exec: Reactor.Executer) void {
     }
 }
 
-fn errno(signed: i32) std.posix.E {
+fn errno(signed: i32) std.os.linux.E {
     return std.posix.errno(@as(isize, signed));
 }
