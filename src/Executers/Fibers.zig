@@ -206,15 +206,12 @@ fn schedule(rt: *Fibers, task: *Task.Detached) void {
     rt.free_threads.mutex.unlock();
 
     if (maybe_thread) |thread| {
-        log.info("pushing to free thread", .{});
         thread.push(task);
 
         rt.reactor.vtable.wakeThread(rt.reactor.ctx, if (Thread.self) |self| self.io_ctx else null, @ptrCast(thread.io_ctx));
     } else if (Thread.self) |t| {
-        log.info("pushing to current thread", .{});
         t.push(task);
     } else {
-        log.info("no thread to push to, using main thread", .{});
         rt.threads[0].push(task);
     }
 }
@@ -330,9 +327,7 @@ const Task = union(enum) {
             }
 
             const task_count = rt.shutdown.task_count.fetchSub(1, .acq_rel);
-            log.info("task count: {any}", .{task_count});
             if (task_count == 1) {
-                log.info("last task finished, signaling shutdown", .{});
                 rt.shutdown.mutex.lock();
                 rt.shutdown.cond.signal();
                 rt.shutdown.mutex.unlock();
@@ -447,7 +442,6 @@ const Fiber = struct {
                 t.call();
             },
         }
-        log.info("task finished", .{});
 
         task.yeild();
 
@@ -520,10 +514,8 @@ const Thread = struct {
                 };
                 contextSwitch(&Thread.current().idle_context, &t.fiber.ctx);
                 const new_state = t.state.cmpxchgStrong(.Running, .Idle, .acq_rel, .acquire);
-                log.info("task finished: {any}", .{new_state});
 
                 if (new_state == .Rerun) {
-                    log.info("rerunning task", .{});
                     t.state.store(.Queued, .release);
                     thread.push(t);
                 }
@@ -531,7 +523,6 @@ const Thread = struct {
 
             if (rt.shutdown.task_count.load(.acquire) == 0) {
                 if (rt.shutdown.requested.load(.acquire)) {
-                    log.info("shutting down", .{});
                     break;
                 }
             }
@@ -602,7 +593,6 @@ fn joinTask(ctx: ?*anyopaque, handle: *Runtime.AnySpawnHandle, result: []u8) voi
     task.waiter.store(Thread.current().current_task.?, .release);
 
     while (task.state.load(.acquire) != .Completed) {
-        log.info("waiting for task to complete", .{});
         Task.yeild(Task.current());
     }
 

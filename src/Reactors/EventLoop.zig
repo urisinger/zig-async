@@ -25,7 +25,6 @@ const ThreadContext = struct {
 
     pub fn init(event_loop: *EventLoop) ThreadContext {
         const wake_fd = std.os.linux.eventfd(0, 0);
-        std.log.info("init thread context, wake_fd: {d}", .{wake_fd});
         return .{
             .io_uring = IoUring.init(io_uring_entries, 0) catch unreachable,
             .event_loop = event_loop,
@@ -277,7 +276,6 @@ fn sleep(ctx: ?*anyopaque, exec: Reactor.Executer, ms: u64) void {
     while (true) {
         exec.@"suspend"();
         if (op.has_result) {
-            log.info("timeout_op.result: {any}", .{op.result});
             switch (errno(op.result)) {
                 .SUCCESS => {
                     op.has_result = false;
@@ -297,7 +295,6 @@ fn sleep(ctx: ?*anyopaque, exec: Reactor.Executer, ms: u64) void {
 
 fn wakeThread(global_ctx: ?*anyopaque, cur_thread_ctx: ?*anyopaque, other_thread_ctx: ?*anyopaque) void {
     _ = global_ctx;
-    log.info("wakeThread", .{});
     if (cur_thread_ctx) |thread| {
         const cur_thread: *ThreadContext = @alignCast(@ptrCast(thread));
         const other_thread: *ThreadContext = @alignCast(@ptrCast(other_thread_ctx));
@@ -359,15 +356,15 @@ fn onPark(global_ctx: ?*anyopaque, exec: Reactor.Executer) void {
         var cqes: [io_uring_entries]std.os.linux.io_uring_cqe = undefined;
         const completed = while (true) {
             break io_uring.copy_cqes(&cqes, 1) catch {
-                //log.err("Failed to get completion events {any}", .{err});
                 continue;
             };
         };
 
-        var noop_count: u32 = 0;
+        var should_wake: bool = false;
         // Process completed operations
         for (cqes[0..completed]) |cqe| {
             if (cqe.user_data == 0) {
+                should_wake = true;
                 continue;
             }
 
@@ -375,13 +372,13 @@ fn onPark(global_ctx: ?*anyopaque, exec: Reactor.Executer) void {
             const op: *Operation = @ptrFromInt(cqe.user_data);
             if (op.has_result) {
                 thread_ctx.destroyOp(op);
-                noop_count += 1;
                 continue;
             }
 
             // Set the result based on the completion event
             op.result = cqe.res;
             op.has_result = true;
+            should_wake = true;
 
             // Wake up the suspended future if there's a waker
             if (op.waker) |waker| {
@@ -389,12 +386,9 @@ fn onPark(global_ctx: ?*anyopaque, exec: Reactor.Executer) void {
             }
         }
 
-        if (noop_count == completed) {
-            log.info("noop_count == completed", .{});
-            continue;
+        if (should_wake) {
+            break;
         }
-
-        break;
     }
 }
 

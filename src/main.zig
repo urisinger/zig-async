@@ -13,83 +13,86 @@ pub fn main() !void {
 
     var event_loop = EventLoop.init(gpa.allocator());
     var fibers = try Fibers.init(allocator, event_loop.reactor());
+    defer fibers.deinit();
 
     const rt = fibers.runtime();
 
     _ = rt.spawn(run, .{rt});
-
-    fibers.deinit();
 }
 
 pub fn run(rt: Runtime) i32 {
     log.info("hi", .{});
     {
-        var fu1: Future(run1) = .init(.{rt});
-        var fu2: Future(run2) = .init(.{rt});
-        var fu3: Future(run3) = .init(.{rt});
+        var fu1: Future(sleep) = .init(.{rt});
+        var fu2: Future(write) = .init(.{rt});
+        var fu3: Future(read) = .init(.{rt});
         const result = rt.join(.{ &fu1, &fu2, &fu3 });
         log.info("result: {any}", .{result});
     }
 
     {
-        var fu1: Future(run1) = .init(.{rt});
-        var fu2: Future(run2) = .init(.{rt});
-        var fu3: Future(run3) = .init(.{rt});
+        var fu1: Future(sleep) = .init(.{rt});
+        var fu2: Future(write) = .init(.{rt});
+        var fu3: Future(read) = .init(.{rt});
         const result = rt.select(.{ &fu1, &fu2, &fu3 });
         log.info("result: {}", .{result});
     }
-
-    const handle = rt.spawn(run4, .{rt});
-    log.info("result: {any}", .{handle.join(rt)});
 
     log.info("main finished", .{});
     return 0;
 }
 
-pub fn run1(rt: Runtime) i32 {
+pub fn sleep(rt: Runtime) i32 {
     log.info("future 1 running", .{});
-    const handle1 = rt.spawn(run2, .{rt});
+    const handle1 = rt.spawn(write, .{rt});
     rt.sleep(1000);
-    const handle2 = rt.spawn(run3, .{rt});
+
+    const handle2 = rt.spawn(read, .{rt});
     _ = handle1.join(rt);
     _ = handle2.join(rt);
 
     return 1;
 }
 
-pub fn run2(rt: Runtime) i32 {
-    _ = rt;
-    log.info("future 2 running", .{});
+pub fn write(rt: Runtime) i32 {
+    const file = rt.open("/dev/null", .{ .mode = .write_only }) catch unreachable;
+    const write_count = 10;
+    const write_size = 1000;
+    var res: [write_count][write_size]u8 = undefined;
+    var write_handles: [write_count]*Runtime.File.AnyWriteHandle = undefined;
+    var write_sum: usize = 0;
+    for (0..write_count) |i| {
+        write_handles[i] = file.write(rt, &res[i]);
+    }
 
-    log.info("future 2 done", .{});
+    for (write_handles) |write_handle| {
+        const bytes_written = write_handle.@"await"(rt) catch return 0;
+        log.info("written: {} bytes", .{bytes_written});
+        write_sum += bytes_written;
+    }
 
     return 2;
 }
 
-pub fn run3(rt: Runtime) usize {
+pub fn read(rt: Runtime) usize {
     log.info("future 3 running", .{});
 
     const file = rt.open("/dev/random", .{ .mode = .read_only }) catch unreachable;
-    const read_count = 100;
-    const read_size = 100;
+    const read_count = 10;
+    const read_size = 1000;
     var res: [read_count][read_size]u8 = undefined;
     var read_handles: [read_count]*Runtime.File.AnyReadHandle = undefined;
     var read_sum: usize = 0;
     for (0..read_count) |i| {
         read_handles[i] = file.read(rt, &res[i]);
     }
-    for (0..read_count) |i| {
-        const read = read_handles[i].@"await"(rt) catch return 0;
-        log.info("read: {} bytes", .{read});
-        read_sum += read;
+    for (read_handles) |read_handle| {
+        const bytes_read = read_handle.@"await"(rt) catch return 0;
+        log.info("read: {} bytes", .{bytes_read});
+        read_sum += bytes_read;
     }
 
     file.close(rt);
 
     return read_sum;
-}
-
-pub fn run4(rt: Runtime) void {
-    _ = rt;
-    log.info("future 4 running", .{});
 }

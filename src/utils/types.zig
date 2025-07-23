@@ -463,8 +463,6 @@ test "EitherPtr: stress test with 2^20 values" {
         else
             1;
 
-        std.log.info("iterations: {d}, step: {d}", .{ iterations, step });
-
         var i: usize = 0;
         var value_counter: usize = 0;
         while (i < iterations) : (i += 1) {
