@@ -70,7 +70,7 @@ pub fn run3(rt: Runtime) usize {
     log.info("future 3 running", .{});
 
     const file = rt.open("/dev/random", .{ .mode = .read_only }) catch unreachable;
-    const read_count = 10;
+    const read_count = 100;
     const read_size = 100;
     var res: [read_count][read_size]u8 = undefined;
     var read_handles: [read_count]*Runtime.File.AnyReadHandle = undefined;

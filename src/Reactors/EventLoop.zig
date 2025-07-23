@@ -339,19 +339,17 @@ fn onPark(global_ctx: ?*anyopaque, exec: Reactor.Executer) void {
 
         var wake_buffer: [8]u8 = undefined;
 
-        const sqe = thread_ctx.io_uring.get_sqe() catch {
-            @panic("failed to get sqe");
-        };
-
-        sqe.prep_read(thread_ctx.wake_fd, &wake_buffer, 0);
-        sqe.user_data = 0; // No operation needed for wake read
+        if (thread_ctx.io_uring.get_sqe() catch null) |sqe| {
+            sqe.prep_read(thread_ctx.wake_fd, &wake_buffer, 0);
+            sqe.user_data = 0;
+        }
 
         // We flush our dynamic submission queue to the static one.
-        while (thread_ctx.sqe_overflow.readItem()) |item| {
+        while (thread_ctx.sqe_overflow.count > 0) {
             const free_sqe = io_uring.get_sqe() catch {
                 break;
             };
-            free_sqe.* = item;
+            free_sqe.* = thread_ctx.sqe_overflow.readItem().?;
         }
 
         // Submit pending operations and wait for at least one completion
