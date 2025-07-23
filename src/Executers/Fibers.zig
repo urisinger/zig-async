@@ -2,6 +2,8 @@ const std = @import("std");
 const builtin = @import("builtin");
 const root = @import("root");
 
+const Alignment = std.mem.Alignment;
+
 const Runtime = @import("../Runtime.zig");
 const Reactor = @import("../Reactor.zig");
 const types = @import("../utils/types.zig");
@@ -10,6 +12,11 @@ const log = std.log.scoped(.Fibers);
 const assert = std.debug.assert;
 
 const Fibers = @This();
+const stack_size = 1024 * 1024 * 10;
+const page_size = std.heap.pageSize();
+const page_align = Alignment.fromByteUnits(page_size);
+
+const page_size_min = std.heap.page_size_min;
 
 allocator: std.mem.Allocator,
 
@@ -121,8 +128,7 @@ pub fn deinit(self: *Fibers) void {
     self.free_threads.list.deinit();
 
     for (self.detached_tasks.list.items) |task| {
-        task.deinit(self.allocator);
-        self.allocator.destroy(task);
+        task.deinit();
     }
     self.detached_tasks.list.deinit();
     self.allocator.free(self.threads);
@@ -218,9 +224,9 @@ const Task = union(enum) {
         fiber: Fiber,
         start: *const fn (context: *const anyopaque, result: *anyopaque) void,
         context_buf: []u8,
-        context_alignment: std.mem.Alignment,
+        context_alignment: Alignment,
         result_buf: []u8,
-        result_alignment: std.mem.Alignment,
+        result_alignment: Alignment,
 
         state: std.atomic.Value(TaskState),
 
@@ -233,6 +239,81 @@ const Task = union(enum) {
             Rerun,
             Completed,
         };
+
+        pub fn init(
+            start: *const fn (context: *const anyopaque, result: *anyopaque) void,
+            context: []const u8,
+            context_alignment: Alignment,
+            result_len: usize,
+            result_alignment: Alignment,
+        ) !*Detached {
+            const stack_mem = std.heap.PageAllocator.map(stack_size, page_align) orelse return error.OutOfMemory;
+            const stack_bottom = @intFromPtr(stack_mem);
+            var stack_top = stack_bottom + stack_size;
+
+            // Calculate space needed for structures (placed at top, stack grows down)
+            const detached_size = @sizeOf(Detached);
+            const detached_align = Alignment.fromByteUnits(@alignOf(Detached));
+
+            // Align context size and position
+            const task_ptr = detached_align.backward(stack_top - detached_size);
+            stack_top = task_ptr;
+
+            const context_ptr = if (context.len > 0)
+                context_alignment.backward(stack_top - context.len)
+            else
+                stack_top;
+            stack_top = context_ptr;
+
+            const result_ptr = if (result_len > 0)
+                result_alignment.backward(stack_top - result_len)
+            else
+                stack_top;
+            stack_top = result_ptr;
+
+            stack_top = std.mem.alignBackward(usize, stack_top, 16);
+
+            // Ensure we have minimum stack space
+            const min_stack_space = 1024;
+            if (stack_top < stack_bottom + min_stack_space) {
+                std.heap.PageAllocator.unmap(@alignCast(stack_mem[0..stack_size]));
+                return error.OutOfMemory;
+            }
+
+            // Create pointers to structures
+            const task: *Detached = @ptrFromInt(task_ptr);
+
+            const context_buf: []u8 = if (context.len > 0)
+                @as([*]u8, @ptrFromInt(context_ptr))[0..context.len]
+            else
+                &[_]u8{};
+
+            const result_buf: []u8 = if (result_len > 0)
+                @as([*]u8, @ptrFromInt(result_ptr))[0..result_len]
+            else
+                &[_]u8{};
+
+            @memcpy(context_buf, context);
+
+            // Initialize task - stack grows down from stack_top
+            const aligned_ptr: [*]align(4096) u8 = @alignCast(stack_mem);
+            const aligned_stack: []align(4096) u8 = aligned_ptr[0..stack_size];
+            task.* = .{
+                .fiber = .{
+                    .stack = aligned_stack, // Store properly aligned slice
+                    .ctx = .init(@intFromPtr(&Fiber.trampoline), stack_top),
+                },
+                .start = start,
+                .context_buf = context_buf,
+                .context_alignment = context_alignment,
+                .result_buf = result_buf,
+                .result_alignment = result_alignment,
+                .state = .init(.Queued),
+                .waiter = .init(null),
+            };
+
+            return task;
+        }
 
         fn call(task: *Detached) void {
             task.start(@ptrCast(task.context_buf.ptr), @ptrCast(task.result_buf.ptr));
@@ -255,14 +336,8 @@ const Task = union(enum) {
             }
         }
 
-        fn deinit(task: *Detached, allocator: std.mem.Allocator) void {
-            task.fiber.deinit(allocator);
-            if (task.context_buf.len > 0) {
-                allocator.rawFree(task.context_buf, task.context_alignment, @returnAddress());
-            }
-            if (task.result_buf.len > 0) {
-                allocator.rawFree(task.result_buf, task.result_alignment, @returnAddress());
-            }
+        fn deinit(task: *Detached) void {
+            std.heap.PageAllocator.unmap(task.fiber.stack);
         }
     };
 
@@ -274,13 +349,53 @@ const Task = union(enum) {
         waiter: Task,
         finished: bool = false,
 
+        pub const Node = struct {
+            task: Async,
+            next: ?*Node,
+        };
+
+        fn init(
+            start: *const fn (arg: *anyopaque) void,
+            arg: *anyopaque,
+            waiter: Task,
+        ) !*Node {
+            // Use aligned allocation for consistency with Detached tasks
+            const stack_mem = std.heap.PageAllocator.map(stack_size, page_align) orelse return error.OutOfMemory;
+            const stack_bottom = @intFromPtr(stack_mem);
+            var stack_top = stack_bottom + stack_size;
+
+            const async_size = @sizeOf(Node);
+            const async_align = Alignment.fromByteUnits(@alignOf(Node));
+
+            const task_ptr = async_align.backward(stack_top - async_size);
+            stack_top = task_ptr;
+
+            stack_top = std.mem.alignBackward(usize, stack_top, 16);
+
+            const node: *Node = @ptrFromInt(task_ptr);
+            node.* = .{
+                .task = .{
+                    .fiber = .{
+                        .ctx = .init(@intFromPtr(&Fiber.trampoline), stack_top),
+                        .stack = @alignCast(stack_mem[0..stack_size]),
+                    },
+                    .start = start,
+                    .arg = arg,
+                    .waiter = waiter,
+                    .finished = false,
+                },
+                .next = null,
+            };
+            return node;
+        }
+
         fn call(task: *Async) void {
             task.start(task.arg);
             task.finished = true;
         }
 
-        fn deinit(task: *Async, allocator: std.mem.Allocator) void {
-            task.fiber.deinit(allocator);
+        fn deinit(task: *Async) void {
+            std.heap.PageAllocator.unmap(task.fiber.stack);
         }
     };
 
@@ -317,22 +432,7 @@ const Task = union(enum) {
 /// A single fiber, with its own stack and saved context.
 const Fiber = struct {
     ctx: Context,
-    stack: []usize,
-
-    /// Initialize a Fiber: alloc a stack, set up a context that will
-    fn init(
-        allocator: std.mem.Allocator,
-        stack_size: usize,
-    ) !Fiber {
-        const stack = try allocator.alloc(usize, @divExact(stack_size, @sizeOf(usize)));
-
-        const top = @intFromPtr(stack.ptr) + stack.len * @sizeOf(usize);
-
-        return .{
-            .ctx = .init(@intFromPtr(&trampoline), top),
-            .stack = stack,
-        };
-    }
+    stack: []align(4096) u8,
 
     fn trampoline() callconv(.C) noreturn {
         const task = Task.current();
@@ -349,10 +449,6 @@ const Fiber = struct {
         task.yeild();
 
         unreachable;
-    }
-
-    pub fn deinit(fiber: *Fiber, allocator: std.mem.Allocator) void {
-        allocator.free(fiber.stack);
     }
 };
 
@@ -467,6 +563,177 @@ const Thread = struct {
     }
 };
 
+fn spawn(
+    ctx: ?*anyopaque,
+    context: []const u8,
+    context_alignment: std.mem.Alignment,
+    result_len: usize,
+    result_alignment: std.mem.Alignment,
+    start: *const fn (context: *const anyopaque, result: *anyopaque) void,
+) *Runtime.AnySpawnHandle {
+    const rt: *Fibers = @alignCast(@ptrCast(ctx));
+
+    const task = Task.Detached.init(
+        start,
+        context,
+        context_alignment,
+        result_len,
+        result_alignment,
+    ) catch unreachable;
+
+    rt.detached_tasks.mutex.lock();
+    rt.detached_tasks.list.append(task) catch unreachable;
+    rt.detached_tasks.mutex.unlock();
+
+    _ = rt.shutdown.task_count.fetchAdd(1, .acq_rel);
+
+    rt.schedule(task);
+
+    return @ptrCast(task);
+}
+
+fn joinTask(ctx: ?*anyopaque, handle: *Runtime.AnySpawnHandle, result: []u8) void {
+    _ = ctx;
+    const task: *Task.Detached = @alignCast(@ptrCast(handle));
+
+    task.waiter.store(Thread.current().current_task.?, .release);
+
+    while (task.state.load(.acquire) != .Completed) {
+        log.info("waiting for task to complete", .{});
+        Task.yeild(Task.current());
+    }
+
+    @memcpy(result, task.result_buf);
+}
+
+fn select(
+    ctx: ?*anyopaque,
+    futures: []const Runtime.AnyFuture,
+) usize {
+    _ = ctx;
+    const me = Task.current();
+
+    // Create linked list of task nodes
+    var head: ?*Task.Async.Node = null;
+    var current: ?*Task.Async.Node = null;
+
+    var i: usize = 0;
+    for (futures) |afut| {
+        const node = Task.Async.init(
+            afut.start,
+            @ptrCast(afut.arg),
+            me,
+        ) catch unreachable;
+
+        // Add to linked list
+        if (head == null) {
+            head = node;
+            current = node;
+        } else {
+            current.?.next = node;
+            current = node;
+        }
+
+        i += 1;
+    }
+
+    const result = outer: while (true) {
+        // Iterate through linked list
+        var node = head;
+        var index: usize = 0;
+        while (node) |current_node| {
+            Task.cur = .{
+                .@"async" = &current_node.task,
+            };
+            if (current_node.task.finished) {
+                break :outer index;
+            }
+            contextSwitch(&me.fiber().ctx, &current_node.task.fiber.ctx);
+            if (current_node.task.finished) {
+                break :outer index;
+            }
+            node = current_node.next;
+            index += 1;
+        }
+        Task.yeild(me);
+    };
+
+    // Clean up linked list
+    var node = head;
+    while (node) |current_node| {
+        const next = current_node.next;
+        current_node.task.deinit();
+        node = next;
+    }
+
+    return result;
+}
+
+fn join(ctx: ?*anyopaque, futures: []const Runtime.AnyFuture) void {
+    _ = ctx;
+    const me = Task.current();
+
+    // Create linked list of task nodes
+    var head: ?*Task.Async.Node = null;
+    var current: ?*Task.Async.Node = null;
+
+    var i: usize = 0;
+    for (futures) |afut| {
+        const node = Task.Async.init(
+            afut.start,
+            @ptrCast(afut.arg),
+            me,
+        ) catch unreachable;
+
+        // Add to linked list
+        if (head == null) {
+            head = node;
+            current = node;
+        } else {
+            current.?.next = node;
+            current = node;
+        }
+
+        i += 1;
+    }
+
+    while (true) {
+        var all_finished = true;
+
+        // Iterate through linked list
+        var node = head;
+        while (node) |current_node| {
+            if (!current_node.task.finished) {
+                Task.cur = .{
+                    .@"async" = &current_node.task,
+                };
+                contextSwitch(&me.fiber().ctx, &current_node.task.fiber.ctx);
+                if (!current_node.task.finished) {
+                    all_finished = false;
+                }
+            }
+            node = current_node.next;
+        }
+
+        if (all_finished) {
+            break;
+        }
+
+        Task.yeild(me);
+    }
+
+    // Clean up linked list and verify all tasks finished
+    var node = head;
+    while (node) |current_node| {
+        if (!current_node.task.finished) {
+            unreachable;
+        }
+        const next = current_node.next;
+        current_node.task.deinit();
+        node = next;
+    }
+}
+
 // Places fiber on current thread
 fn wake(ctx: ?*anyopaque, waker: *anyopaque) void {
     _ = ctx;
@@ -517,173 +784,4 @@ fn pwrite(ctx: ?*anyopaque, file: Runtime.File, buffer: []const u8, offset: std.
 fn sleep(ctx: ?*anyopaque, ms: u64) void {
     const rt: *Fibers = @alignCast(@ptrCast(ctx));
     rt.reactor.vtable.sleep(rt.reactor.ctx, rt.executer(), ms);
-}
-
-fn spawn(
-    ctx: ?*anyopaque,
-    context: []const u8,
-    context_alignment: std.mem.Alignment,
-    result_len: usize,
-    result_alignment: std.mem.Alignment,
-    start: *const fn (context: *const anyopaque, result: *anyopaque) void,
-) *Runtime.AnySpawnHandle {
-    const rt: *Fibers = @alignCast(@ptrCast(ctx));
-
-    const context_buf: []u8 = if (context.len > 0)
-        (rt.allocator.rawAlloc(context.len, context_alignment, @returnAddress()) orelse unreachable)[0..context.len]
-    else
-        &[_]u8{};
-    const result_buf: []u8 = if (result_len > 0)
-        (rt.allocator.rawAlloc(result_len, result_alignment, @returnAddress()) orelse unreachable)[0..result_len]
-    else
-        &[_]u8{};
-
-    @memcpy(context_buf, context);
-
-    const task: *Task.Detached = rt.allocator.create(Task.Detached) catch unreachable;
-
-    task.* = .{
-        .fiber = Fiber.init(
-            rt.allocator,
-            1024 * 1024 * 10,
-        ) catch unreachable,
-        .start = start,
-        .context_buf = context_buf,
-        .context_alignment = context_alignment,
-        .result_buf = result_buf,
-        .result_alignment = result_alignment,
-        .state = .init(.Queued),
-        .waiter = .init(null),
-    };
-
-    rt.detached_tasks.mutex.lock();
-    rt.detached_tasks.list.append(task) catch unreachable;
-    rt.detached_tasks.mutex.unlock();
-
-    _ = rt.shutdown.task_count.fetchAdd(1, .acq_rel);
-
-    rt.schedule(task);
-
-    return @ptrCast(task);
-}
-
-fn joinTask(ctx: ?*anyopaque, handle: *Runtime.AnySpawnHandle, result: []u8) void {
-    _ = ctx;
-    const task: *Task.Detached = @alignCast(@ptrCast(handle));
-
-    task.waiter.store(Thread.current().current_task.?, .release);
-
-    while (task.state.load(.acquire) != .Completed) {
-        log.info("waiting for task to complete", .{});
-        Task.yeild(Task.current());
-    }
-
-    @memcpy(result, task.result_buf);
-}
-
-fn select(
-    ctx: ?*anyopaque,
-    futures: []const Runtime.AnyFuture,
-) usize {
-    const rt: *Fibers = @alignCast(@ptrCast(ctx));
-    const me = Task.current();
-
-    const tasks = rt.allocator.alloc(Task.Async, futures.len) catch unreachable;
-    defer rt.allocator.free(tasks);
-
-    var i: usize = 0;
-    for (futures) |afut| {
-        const fiber = Fiber.init(
-            rt.allocator,
-            1024 * 1024 * 10,
-        ) catch unreachable;
-        tasks[i] = .{
-            .fiber = fiber,
-
-            .arg = @ptrCast(afut.arg),
-            .start = afut.start,
-            .waiter = me,
-        };
-
-        i += 1;
-    }
-
-    const result = outer: while (true) {
-        i = 0;
-        for (tasks) |*task| {
-            Task.cur = .{
-                .@"async" = task,
-            };
-            if (task.finished) {
-                break :outer i;
-            }
-            contextSwitch(&me.fiber().ctx, &task.fiber.ctx);
-            if (task.finished) {
-                break :outer i;
-            }
-            i += 1;
-        }
-        Task.yeild(me);
-    };
-
-    for (tasks) |*task| {
-        task.deinit(rt.allocator);
-    }
-
-    return result;
-}
-
-fn join(ctx: ?*anyopaque, futures: []const Runtime.AnyFuture) void {
-    const rt: *Fibers = @alignCast(@ptrCast(ctx));
-    const me = Task.current();
-
-    const tasks = rt.allocator.alloc(Task.Async, futures.len) catch unreachable;
-    defer rt.allocator.free(tasks);
-
-    var i: usize = 0;
-    for (futures) |afut| {
-        const fiber = Fiber.init(
-            rt.allocator,
-            1024 * 1024 * 10,
-        ) catch unreachable;
-        tasks[i] = .{
-            .fiber = fiber,
-
-            .arg = @ptrCast(afut.arg),
-            .start = afut.start,
-            .waiter = me,
-            .finished = false,
-        };
-
-        i += 1;
-    }
-
-    while (true) {
-        var all_finished = true;
-        i = 0;
-        for (tasks) |*task| {
-            if (!task.finished) {
-                Task.cur = .{
-                    .@"async" = task,
-                };
-                contextSwitch(&me.fiber().ctx, &task.fiber.ctx);
-                if (!task.finished) {
-                    all_finished = false;
-                }
-            }
-            i += 1;
-        }
-        if (all_finished) {
-            break;
-        }
-
-        Task.yeild(me);
-    }
-
-    for (tasks) |*task| {
-        if (!task.finished) {
-            unreachable;
-        }
-        task.deinit(rt.allocator);
-    }
 }
