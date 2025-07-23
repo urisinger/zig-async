@@ -13,14 +13,15 @@ pub fn main() !void {
 
     var event_loop = EventLoop.init(gpa.allocator());
     var fibers = try Fibers.init(allocator, event_loop.reactor());
-    defer fibers.deinit();
 
     const rt = fibers.runtime();
 
-    rt.spawn(run, .{rt});
+    _ = rt.spawn(run, .{rt});
+
+    fibers.deinit();
 }
 
-pub fn run(rt: Runtime) void {
+pub fn run(rt: Runtime) i32 {
     log.info("hi", .{});
     {
         var fu1: Future(run1) = .init(.{rt});
@@ -38,9 +39,11 @@ pub fn run(rt: Runtime) void {
         log.info("result: {}", .{result});
     }
 
-    rt.spawn(run4, .{rt});
+    const handle = rt.spawn(run4, .{rt});
+    log.info("result: {any}", .{handle.join(rt)});
 
     log.info("main finished", .{});
+    return 0;
 }
 
 pub fn run1(rt: Runtime) i32 {

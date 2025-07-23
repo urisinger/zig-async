@@ -38,6 +38,7 @@ shutdown: struct {
 reactor: Reactor,
 const rt_vtable: Runtime.VTable = .{
     .spawn = spawn,
+    .joinTask = joinTask,
     .select = select,
     .join = join,
 
@@ -87,7 +88,7 @@ pub fn init(allocator: std.mem.Allocator, reactor: Reactor) !*Fibers {
 
     var thread_id: usize = 0;
     for (threads) |*thread| {
-        thread.handle = std.Thread.spawn(.{}, Thread.entry, .{ rt, thread_id, null }) catch |err| {
+        thread.handle = std.Thread.spawn(.{}, Thread.entry, .{ rt, thread_id }) catch |err| {
             log.err("failed to spawn thread: {s}", .{@errorName(err)});
             unreachable;
         };
@@ -180,9 +181,17 @@ fn contextSwitch(old_ctx: *Context, new_ctx: *const Context) void {
     }
 }
 
-fn schedule(rt: *Fibers, task: *Task.Detached) void {
-    _ = rt.shutdown.task_count.fetchAdd(1, .acq_rel);
+fn reschedule(rt: *Fibers, task: *Task.Detached) void {
+    if (task.state.cmpxchgStrong(.Idle, .Queued, .acq_rel, .acquire)) |old_state| {
+        log.info("task already scheduled: {any}", .{old_state});
+        task.rerun.store(true, .release);
+        return;
+    }
 
+    rt.schedule(task);
+}
+
+fn schedule(rt: *Fibers, task: *Task.Detached) void {
     rt.free_threads.mutex.lock();
     const maybe_thread: ?*Thread = rt.free_threads.list.pop();
     rt.free_threads.mutex.unlock();
@@ -207,11 +216,17 @@ const Task = union(enum) {
 
     const Detached = struct {
         fiber: Fiber,
-        start: *const fn (context: *const anyopaque) void,
+        start: *const fn (context: *const anyopaque, result: *anyopaque) void,
         context_buf: []u8,
         context_alignment: std.mem.Alignment,
+        result_buf: []u8,
+        result_alignment: std.mem.Alignment,
 
         state: std.atomic.Value(TaskState),
+
+        waiter: std.atomic.Value(?*Detached),
+        rerun: std.atomic.Value(bool),
+
         const TaskState = enum(u8) {
             Idle,
             Queued,
@@ -220,13 +235,18 @@ const Task = union(enum) {
         };
 
         fn call(task: *Detached) void {
-            task.start(@ptrCast(task.context_buf.ptr));
+            task.start(@ptrCast(task.context_buf.ptr), @ptrCast(task.result_buf.ptr));
             const thread = Thread.current();
             const rt = thread.rt;
             if (rt.shutdown.task_count.fetchSub(1, .acq_rel) == 1) {
+                log.info("last task finished, signaling shutdown", .{});
                 rt.shutdown.mutex.lock();
                 rt.shutdown.cond.signal();
                 rt.shutdown.mutex.unlock();
+            }
+            _ = task.state.cmpxchgStrong(.Running, .Completed, .acq_rel, .acquire);
+            if (task.waiter.load(.acquire)) |w| {
+                rt.reschedule(w);
             }
         }
 
@@ -234,6 +254,9 @@ const Task = union(enum) {
             task.fiber.deinit(allocator);
             if (task.context_buf.len > 0) {
                 allocator.rawFree(task.context_buf, task.context_alignment, @returnAddress());
+            }
+            if (task.result_buf.len > 0) {
+                allocator.rawFree(task.result_buf, task.result_alignment, @returnAddress());
             }
         }
     };
@@ -274,15 +297,15 @@ const Task = union(enum) {
     }
 
     fn yeild(old_task: Task) void {
-        switch (old_task) {
-            .detached => |t| {
-                contextSwitch(&t.fiber.ctx, &Thread.current().idle_context);
-            },
+        const old_fiber = old_task.fiber();
+        const new_ctx = ctx: switch (old_task) {
+            .detached => &Thread.current().idle_context,
             .@"async" => |t| {
-                cur = t.waiter;
-                contextSwitch(&t.fiber.ctx, &t.waiter.fiber().ctx);
+                Task.cur = t.waiter;
+                break :ctx &t.waiter.fiber().ctx;
             },
-        }
+        };
+        contextSwitch(&old_fiber.ctx, new_ctx);
     }
 };
 
@@ -316,6 +339,8 @@ const Fiber = struct {
                 t.call();
             },
         }
+        log.info("task finished", .{});
+
         task.yeild();
 
         unreachable;
@@ -337,6 +362,7 @@ const Thread = struct {
 
     io_ctx: ?*anyopaque,
 
+    ready_mutex: std.Thread.Mutex,
     ready_queue: std.fifo.LinearFifo(*Task.Detached, .Dynamic),
 
     current_task: ?*Task.Detached,
@@ -351,7 +377,9 @@ const Thread = struct {
 
     // Only push a task to a thread if it is idle!!!
     fn push(t: *Thread, task: *Task.Detached) void {
+        t.ready_mutex.lock();
         t.ready_queue.writeItem(task) catch unreachable;
+        t.ready_mutex.unlock();
     }
 
     // Only the owning thread can pop a task from the queue, we dont steal work here...
@@ -360,7 +388,7 @@ const Thread = struct {
         return task;
     }
 
-    fn entry(rt: *Fibers, thread_id: usize, task: ?*Task.Detached) void {
+    fn entry(rt: *Fibers, thread_id: usize) void {
         // initialize thread, dont touch the handle field
 
         const thread = &rt.threads[thread_id];
@@ -371,23 +399,26 @@ const Thread = struct {
         thread.idle_context = .{};
         thread.io_ctx = rt.reactor.vtable.createContext(rt.reactor.ctx);
         thread.thread_id = thread_id;
-        thread.current_task = task;
 
         self = thread;
 
-        if (task) |t| {
-            thread.push(t);
-        }
-
         while (true) {
             while (thread.pop()) |t| {
-                _ = t.state.cmpxchgStrong(.Queued, .Running, .acq_rel, .acquire);
+                const old_state = t.state.cmpxchgStrong(.Queued, .Running, .acq_rel, .acquire);
+                if (old_state == .Completed) {
+                    continue;
+                }
                 thread.current_task = t;
                 Task.cur = .{
                     .detached = t,
                 };
                 contextSwitch(&Thread.current().idle_context, &t.fiber.ctx);
-                _ = t.state.cmpxchgStrong(.Running, .Idle, .acq_rel, .acquire);
+                const new_state = t.state.cmpxchgStrong(.Running, .Idle, .acq_rel, .acquire);
+                log.info("task finished: {any}", .{new_state});
+
+                if (t.rerun.load(.acquire)) {
+                    rt.schedule(t);
+                }
             }
 
             if (rt.shutdown.task_count.load(.acquire) == 0) {
@@ -434,6 +465,8 @@ fn wake(ctx: ?*anyopaque, waker: *anyopaque) void {
 
     const t = Thread.current();
     t.push(task);
+
+    _ = task.state.cmpxchgStrong(.Idle, .Queued, .acq_rel, .acquire);
 }
 
 fn getWaker(ctx: ?*anyopaque) *anyopaque {
@@ -446,7 +479,7 @@ fn getThreadContext(ctx: ?*anyopaque) ?*anyopaque {
     return Thread.current().io_ctx;
 }
 
-/// simply set ourselves to blocking, we wont unblock until we get woken up
+/// simply set ourselves to blocking, this is similar to returning Poll::Pending in rust
 fn @"suspend"(ctx: ?*anyopaque) void {
     _ = ctx;
     Task.yeild(Task.current());
@@ -476,12 +509,18 @@ fn spawn(
     ctx: ?*anyopaque,
     context: []const u8,
     context_alignment: std.mem.Alignment,
-    start: *const fn (context: *const anyopaque) void,
-) void {
+    result_len: usize,
+    result_alignment: std.mem.Alignment,
+    start: *const fn (context: *const anyopaque, result: *anyopaque) void,
+) *Runtime.AnySpawnHandle {
     const rt: *Fibers = @alignCast(@ptrCast(ctx));
 
     const context_buf: []u8 = if (context.len > 0)
         (rt.allocator.rawAlloc(context.len, context_alignment, @returnAddress()) orelse unreachable)[0..context.len]
+    else
+        &[_]u8{};
+    const result_buf: []u8 = if (result_len > 0)
+        (rt.allocator.rawAlloc(result_len, result_alignment, @returnAddress()) orelse unreachable)[0..result_len]
     else
         &[_]u8{};
 
@@ -497,14 +536,36 @@ fn spawn(
         .start = start,
         .context_buf = context_buf,
         .context_alignment = context_alignment,
-        .state = .init(.Idle),
+        .result_buf = result_buf,
+        .result_alignment = result_alignment,
+        .state = .init(.Queued),
+        .waiter = .init(null),
+        .rerun = .init(false),
     };
 
     rt.detached_tasks.mutex.lock();
     rt.detached_tasks.list.append(task) catch unreachable;
     rt.detached_tasks.mutex.unlock();
 
+    _ = rt.shutdown.task_count.fetchAdd(1, .acq_rel);
+
     rt.schedule(task);
+
+    return @ptrCast(task);
+}
+
+fn joinTask(ctx: ?*anyopaque, handle: *Runtime.AnySpawnHandle, result: []u8) void {
+    _ = ctx;
+    const task: *Task.Detached = @alignCast(@ptrCast(handle));
+
+    task.waiter.store(Thread.current().current_task.?, .release);
+
+    while (task.state.load(.acquire) != .Completed) {
+        log.info("waiting for task to complete", .{});
+        Task.yeild(Task.current());
+    }
+
+    @memcpy(result, task.result_buf);
 }
 
 fn select(

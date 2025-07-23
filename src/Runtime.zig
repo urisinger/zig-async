@@ -9,11 +9,6 @@ const FileHandle = opaque {};
 ctx: ?*anyopaque,
 vtable: *const VTable,
 
-pub const AnyFuture = struct {
-    start: *const fn (arg: *anyopaque) void,
-    arg: *anyopaque,
-};
-
 pub const VTable = struct {
     /// runtimeutes `start` asynchronously in a manner such that it cleans itself
     /// up. This mode does not support results, await, or cancel.
@@ -25,8 +20,13 @@ pub const VTable = struct {
         /// Copied and then passed to `start`.
         context: []const u8,
         context_alignment: std.mem.Alignment,
-        start: *const fn (context: *const anyopaque) void,
-    ) void,
+        result_len: usize,
+        result_alignment: std.mem.Alignment,
+        start: *const fn (context: *const anyopaque, result: *anyopaque) void,
+    ) *AnySpawnHandle,
+
+    joinTask: *const fn (ctx: ?*anyopaque, task: *AnySpawnHandle, result: []u8) void,
+
     /// Runs all the futures in parallel, and waits for them all to finish.
     ///
     /// Thread-safe.
@@ -43,6 +43,8 @@ pub const VTable = struct {
     pread: *const fn (ctx: ?*anyopaque, file: File, buffer: []u8, offset: std.posix.off_t) File.PReadError!usize,
     pwrite: *const fn (ctx: ?*anyopaque, file: File, buffer: []const u8, offset: std.posix.off_t) File.PWriteError!usize,
 };
+
+pub const AnySpawnHandle = opaque {};
 
 pub const File = struct {
     handle: Handle,
@@ -100,6 +102,11 @@ pub const File = struct {
     }
 };
 
+pub const AnyFuture = struct {
+    start: *const fn (arg: *anyopaque) void,
+    arg: *anyopaque,
+};
+
 pub fn Future(comptime Fn: anytype) type {
     const fn_info = @typeInfo(@TypeOf(Fn)).@"fn";
     return struct {
@@ -130,17 +137,44 @@ pub fn Future(comptime Fn: anytype) type {
     };
 }
 
-/// Calls `function` with `args` asynchronously. The resource cleans itself up
-/// when the function returns. Does not support await, cancel, or a return value.
-pub inline fn spawn(runtime: Runtime, function: anytype, args: std.meta.ArgsTuple(@TypeOf(function))) void {
-    const Args = @TypeOf(args);
-    const TypeErased = struct {
-        fn start(context: *const anyopaque) void {
-            const args_casted: *const Args = @alignCast(@ptrCast(context));
-            @call(.auto, function, args_casted.*);
+pub fn SpawnHandle(comptime Fn: anytype) type {
+    const fn_info = @typeInfo(@TypeOf(Fn)).@"fn";
+    const Ret = fn_info.return_type.?;
+
+    return struct {
+        const Self = @This();
+        handle: *AnySpawnHandle,
+
+        pub fn join(self: *const @This(), runtime: Runtime) Ret {
+            var result: Ret = undefined;
+            runtime.vtable.joinTask(runtime.ctx, self.handle, if (@sizeOf(Ret) == 0) &.{} else @ptrCast((&result)[0..1]));
+            return result;
         }
     };
-    runtime.vtable.spawn(runtime.ctx, if (@sizeOf(Args) == 0) &.{} else @ptrCast((&args)[0..1]), std.mem.Alignment.fromByteUnits(@alignOf(Args)), TypeErased.start);
+}
+
+/// Calls `function` with `args` asynchronously. The resource cleans itself up
+/// when the function returns. Does not support await, cancel, or a return value.
+pub inline fn spawn(runtime: Runtime, function: anytype, args: std.meta.ArgsTuple(@TypeOf(function))) SpawnHandle(function) {
+    const Args = @TypeOf(args);
+    const Ret = @typeInfo(@TypeOf(function)).@"fn".return_type.?;
+    const TypeErased = struct {
+        fn start(context: *const anyopaque, result: *anyopaque) void {
+            const args_casted: *const Args = @alignCast(@ptrCast(context));
+            const result_casted: *Ret = @alignCast(@ptrCast(result));
+            result_casted.* = @call(.auto, function, args_casted.*);
+        }
+    };
+    return .{
+        .handle = runtime.vtable.spawn(
+            runtime.ctx,
+            if (@sizeOf(Args) == 0) &.{} else @ptrCast((&args)[0..1]),
+            std.mem.Alignment.fromByteUnits(@alignOf(Args)),
+            @sizeOf(Ret),
+            std.mem.Alignment.fromByteUnits(@alignOf(Ret)),
+            TypeErased.start,
+        ),
+    };
 }
 
 pub fn JoinResult(S: anytype) type {
