@@ -1,8 +1,7 @@
 const std = @import("std");
 const Runtime = @import("../Runtime.zig");
 const Reactor = @import("../Reactor.zig");
-const types = @import("../utils/types.zig");
-const EitherPtr = types.EitherPtr;
+const TaggedPtr = @import("../utils/types.zig").TaggedPtr;
 
 const log = std.log.scoped(.EventLoop);
 
@@ -18,6 +17,8 @@ allocator: Allocator,
 const ThreadContext = struct {
     event_loop: *EventLoop,
     io_uring: IoUring,
+    ops_buffer: [io_uring_entries]Operation,
+    ops_head: usize = 0, // Ring buffer head pointer
 
     wake_fd: std.os.linux.fd_t,
 
@@ -28,11 +29,24 @@ const ThreadContext = struct {
             .io_uring = IoUring.init(io_uring_entries, 0) catch unreachable,
             .event_loop = event_loop,
             .wake_fd = @intCast(wake_fd),
+            .ops_buffer = std.mem.zeroes([io_uring_entries]Operation),
+            .ops_head = 0,
         };
     }
 
     pub fn deinit(self: *ThreadContext) void {
         self.io_uring.deinit();
+    }
+
+    // Get an SQE and allocate an operation from the ring buffer
+    pub fn getSqeWithOp(self: *ThreadContext) !struct { sqe: *std.os.linux.io_uring_sqe, op: *Operation } {
+        const sqe = try self.io_uring.get_sqe();
+
+        // Get next operation slot from ring buffer
+        const op = &self.ops_buffer[self.ops_head];
+        self.ops_head = (self.ops_head + 1) % io_uring_entries;
+
+        return .{ .sqe = sqe, .op = op };
     }
 };
 
@@ -60,17 +74,9 @@ pub fn init(allocator: Allocator) EventLoop {
 
 // File operation structures for async operations
 const Operation = struct {
-    waker: *anyopaque,
+    waker: ?*anyopaque,
     result: i32,
     has_result: bool = false,
-};
-
-// Either a pointer to an operation,
-const Message = EitherPtr(*Operation, MessageEvent);
-
-const MessageEvent = enum(u2) {
-    Wake,
-    Noop,
 };
 
 const vtable: Reactor.VTable = .{
@@ -120,28 +126,25 @@ pub fn pread(ctx: ?*anyopaque, exec: Reactor.Executer, file: Runtime.File, buffe
     _ = ctx;
     const thread_ctx: *ThreadContext = @alignCast(@ptrCast(exec.getThreadContext()));
 
-    // Create read operation
-    var read_op: Operation = .{
-        .waker = exec.getWaker(),
-        .result = 0,
-    };
-
-    const message = Message.initPtr(&read_op);
-
-    // Submit read operation to io_uring
-    const sqe = thread_ctx.io_uring.get_sqe() catch {
+    // Get SQE and operation from ring buffer
+    const sqe_op = thread_ctx.getSqeWithOp() catch {
         return error.SystemResources;
     };
+    sqe_op.op.* = .{
+        .waker = exec.getWaker(),
+        .result = 0,
+        .has_result = false,
+    };
 
-    sqe.prep_read(file.handle, buffer, @bitCast(offset));
-    sqe.user_data = message.toInner();
+    sqe_op.sqe.prep_read(file.handle, buffer, @bitCast(offset));
+    sqe_op.sqe.user_data = @intFromPtr(sqe_op.op);
 
-    while (!read_op.has_result) {
+    while (!sqe_op.op.has_result) {
         exec.@"suspend"();
     }
 
-    switch (errno(read_op.result)) {
-        .SUCCESS => return @as(u32, @bitCast(read_op.result)),
+    switch (errno(sqe_op.op.result)) {
+        .SUCCESS => return @as(u32, @bitCast(sqe_op.op.result)),
         .INTR => unreachable,
         .CANCELED => return error.Canceled,
 
@@ -158,27 +161,27 @@ pub fn pwrite(ctx: ?*anyopaque, exec: Reactor.Executer, file: Runtime.File, buff
     _ = ctx;
     const thread_ctx: *ThreadContext = @alignCast(@ptrCast(exec.getThreadContext()));
 
-    var write_op: Operation = .{
-        .waker = exec.getWaker(),
-        .result = 0,
-    };
-
-    const message = Message.initPtr(&write_op);
-
-    // Submit write operation to io_uring
-    const sqe = thread_ctx.io_uring.get_sqe() catch {
+    // Get SQE and operation from ring buffer
+    const sqe_op = thread_ctx.getSqeWithOp() catch {
         return error.SystemResources;
     };
-    sqe.prep_write(file.handle, buffer, @bitCast(offset));
-    sqe.user_data = message.toInner();
+
+    sqe_op.op.* = .{
+        .waker = exec.getWaker(),
+        .result = 0,
+        .has_result = false,
+    };
+
+    sqe_op.sqe.prep_write(file.handle, buffer, @bitCast(offset));
+    sqe_op.sqe.user_data = @intFromPtr(sqe_op.op);
 
     // Suspend until the operation completes
-    while (!write_op.has_result) {
+    while (!sqe_op.op.has_result) {
         exec.@"suspend"();
     }
 
-    switch (errno(write_op.result)) {
-        .SUCCESS => return @as(u32, @bitCast(write_op.result)),
+    switch (errno(sqe_op.op.result)) {
+        .SUCCESS => return @as(u32, @bitCast(sqe_op.op.result)),
         .INTR => unreachable,
         .INVAL => unreachable,
         .FAULT => unreachable,
@@ -210,35 +213,40 @@ fn sleep(ctx: ?*anyopaque, exec: Reactor.Executer, ms: u64) void {
 
     const thread_ctx: *ThreadContext = @alignCast(@ptrCast(exec.getThreadContext()));
 
-    const timeout_sqe = thread_ctx.io_uring.get_sqe() catch {
+    // Get SQE and operation from ring buffer
+    const sqe_op = thread_ctx.getSqeWithOp() catch {
         @panic("failed to get sqe");
     };
 
-    var timeout_op: Operation = .{
+    sqe_op.op.* = .{
         .waker = exec.getWaker(),
         .result = 0,
         .has_result = false,
     };
-    const timeout_message = Message.initPtr(&timeout_op);
+
     var ts: std.os.linux.kernel_timespec = .{
         .sec = @intCast(ms / 1000),
         .nsec = @intCast((ms % 1000) * 1000000),
     };
-    timeout_sqe.prep_timeout(&ts, 1, 0);
-    timeout_sqe.user_data = timeout_message.toInner();
+    sqe_op.sqe.prep_timeout(&ts, 0, 0);
+    sqe_op.sqe.user_data = @intFromPtr(sqe_op.op);
 
-    while (!timeout_op.has_result) {
-        log.info("sleeping", .{});
+    while (true) {
         exec.@"suspend"();
-        switch (errno(timeout_op.result)) {
-            .SUCCESS => {},
-            .TIME => {
-                break;
-            },
-            else => |err| {
-                log.err("sleep failed: {any}", .{err});
-                unreachable;
-            },
+        if (sqe_op.op.has_result) {
+            log.info("timeout_op.result: {any}", .{sqe_op.op.result});
+            switch (errno(sqe_op.op.result)) {
+                .SUCCESS => {
+                    sqe_op.op.has_result = false;
+                },
+                .TIME => {
+                    break;
+                },
+                else => |err| {
+                    log.err("sleep failed: {any}", .{err});
+                    unreachable;
+                },
+            }
         }
     }
 }
@@ -250,14 +258,17 @@ fn wakeThread(global_ctx: ?*anyopaque, cur_thread_ctx: ?*anyopaque, other_thread
         const cur_thread: *ThreadContext = @alignCast(@ptrCast(thread));
         const other_thread: *ThreadContext = @alignCast(@ptrCast(other_thread_ctx));
 
-        const sqe = cur_thread.io_uring.get_sqe() catch {
+        const sqe_op = cur_thread.getSqeWithOp() catch {
             @panic("failed to get sqe");
         };
 
-        const message = Message.initValue(.Wake);
-
-        sqe.prep_rw(.MSG_RING, other_thread.io_uring.fd, 0, 0, message.toInner());
-        sqe.user_data = Message.initValue(.Noop).toInner();
+        sqe_op.sqe.prep_rw(
+            .MSG_RING,
+            other_thread.io_uring.fd,
+            0,
+            0,
+            0,
+        );
     } else {
         const other_thread: *ThreadContext = @alignCast(@ptrCast(other_thread_ctx));
 
@@ -283,7 +294,7 @@ fn onPark(global_ctx: ?*anyopaque, exec: Reactor.Executer) void {
         };
 
         sqe.prep_read(thread_ctx.wake_fd, &wake_buffer, 0);
-        sqe.user_data = Message.initValue(.Wake).toInner();
+        sqe.user_data = 0; // No operation needed for wake read
 
         // Submit pending operations and wait for at least one completion
         _ = thread_ctx.io_uring.submit() catch unreachable;
@@ -301,31 +312,23 @@ fn onPark(global_ctx: ?*anyopaque, exec: Reactor.Executer) void {
         // Process completed operations
         for (cqes[0..completed]) |cqe| {
             if (cqe.user_data == 0) {
-                log.info("noop: {any}", .{cqe});
-                noop_count += 1;
-                unreachable;
+                continue;
             }
 
-            const message = Message.fromValue(@as(usize, cqe.user_data));
+            // user_data points to an Operation in the buffer
+            const op: *Operation = @ptrFromInt(cqe.user_data);
+            if (op.has_result) {
+                noop_count += 1;
+                continue;
+            }
 
-            switch (message.asUnion()) {
-                .value => |event| {
-                    switch (event) {
-                        .Wake => {
-                            continue;
-                        },
-                        .Noop => {
-                            noop_count += 1;
-                        },
-                    }
-                },
-                .ptr => |op| {
-                    // Set the result based on the completion event
-                    op.result = cqe.res;
-                    op.has_result = true;
-                    // Wake up the suspended future
-                    exec.wake(op.waker);
-                },
+            // Set the result based on the completion event
+            op.result = cqe.res;
+            op.has_result = true;
+
+            // Wake up the suspended future if there's a waker
+            if (op.waker) |waker| {
+                exec.wake(waker);
             }
         }
 

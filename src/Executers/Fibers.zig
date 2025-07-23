@@ -183,15 +183,12 @@ fn contextSwitch(old_ctx: *Context, new_ctx: *const Context) void {
 }
 
 fn reschedule(rt: *Fibers, task: *Task.Detached) void {
-    if (task.state.cmpxchgStrong(.Idle, .Queued, .acq_rel, .acquire)) |old_state| {
-        if (old_state == .Running) {
-            log.info("task already scheduled: {any}", .{old_state});
-            task.rerun.store(true, .release);
-        }
+    if (task.state.cmpxchgStrong(.Idle, .Queued, .acq_rel, .acquire) == null) {
+        rt.schedule(task);
         return;
     }
 
-    rt.schedule(task);
+    _ = task.state.cmpxchgStrong(.Running, .Rerun, .acq_rel, .acquire);
 }
 
 fn schedule(rt: *Fibers, task: *Task.Detached) void {
@@ -228,12 +225,12 @@ const Task = union(enum) {
         state: std.atomic.Value(TaskState),
 
         waiter: std.atomic.Value(?*Detached),
-        rerun: std.atomic.Value(bool),
 
         const TaskState = enum(u8) {
             Idle,
             Queued,
             Running,
+            Rerun,
             Completed,
         };
 
@@ -426,7 +423,7 @@ const Thread = struct {
                 const new_state = t.state.cmpxchgStrong(.Running, .Idle, .acq_rel, .acquire);
                 log.info("task finished: {any}", .{new_state});
 
-                if (t.rerun.swap(false, .acq_rel) and new_state != .Completed) {
+                if (new_state == .Rerun) {
                     log.info("rerunning task", .{});
                     t.state.store(.Queued, .release);
                     thread.push(t);
@@ -557,7 +554,6 @@ fn spawn(
         .result_alignment = result_alignment,
         .state = .init(.Queued),
         .waiter = .init(null),
-        .rerun = .init(false),
     };
 
     rt.detached_tasks.mutex.lock();

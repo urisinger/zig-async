@@ -49,6 +49,7 @@ pub fn run(rt: Runtime) i32 {
 pub fn run1(rt: Runtime) i32 {
     log.info("future 1 running", .{});
     const handle1 = rt.spawn(run2, .{rt});
+    rt.sleep(1000);
     const handle2 = rt.spawn(run3, .{rt});
     _ = handle1.join(rt);
     _ = handle2.join(rt);
