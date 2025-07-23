@@ -40,8 +40,10 @@ pub const VTable = struct {
 
     openFile: *const fn (ctx: ?*anyopaque, path: []const u8, flags: File.OpenFlags) File.OpenError!File,
     closeFile: *const fn (ctx: ?*anyopaque, file: File) void,
-    pread: *const fn (ctx: ?*anyopaque, file: File, buffer: []u8, offset: std.posix.off_t) File.PReadError!usize,
-    pwrite: *const fn (ctx: ?*anyopaque, file: File, buffer: []const u8, offset: std.posix.off_t) File.PWriteError!usize,
+    pread: *const fn (ctx: ?*anyopaque, file: File, buffer: []u8, offset: std.posix.off_t) *File.AnyReadHandle,
+    awaitRead: *const fn (ctx: ?*anyopaque, handle: *File.AnyReadHandle) File.PReadError!usize,
+    pwrite: *const fn (ctx: ?*anyopaque, file: File, buffer: []const u8, offset: std.posix.off_t) *File.AnyWriteHandle,
+    awaitWrite: *const fn (ctx: ?*anyopaque, handle: *File.AnyWriteHandle) File.PWriteError!usize,
     sleep: *const fn (ctx: ?*anyopaque, ms: u64) void,
 };
 
@@ -51,6 +53,18 @@ pub const File = struct {
     handle: Handle,
 
     pub const Handle = std.posix.fd_t;
+
+    pub const AnyReadHandle = opaque {
+        pub fn @"await"(self: *AnyReadHandle, runtime: Runtime) PReadError!usize {
+            return runtime.vtable.awaitRead(runtime.ctx, self);
+        }
+    };
+
+    pub const AnyWriteHandle = opaque {
+        pub fn @"await"(self: *AnyWriteHandle, runtime: Runtime) PWriteError!usize {
+            return runtime.vtable.awaitWrite(runtime.ctx, self);
+        }
+    };
 
     pub const OpenFlags = fs.File.OpenFlags;
     pub const CreateFlags = fs.File.CreateFlags;
@@ -63,8 +77,8 @@ pub const File = struct {
 
     pub const ReadError = fs.File.ReadError;
 
-    pub fn read(file: File, runtime: Runtime, buffer: []u8) ReadError!usize {
-        return @errorCast(runtime.vtable.pread(runtime.ctx, file, buffer, -1));
+    pub fn read(file: File, runtime: Runtime, buffer: []u8) *AnyReadHandle {
+        return runtime.vtable.pread(runtime.ctx, file, buffer, -1);
     }
 
     pub const PReadError = fs.File.PReadError;
@@ -75,31 +89,14 @@ pub const File = struct {
 
     pub const WriteError = fs.File.WriteError;
 
-    pub fn write(file: File, runtime: Runtime, buffer: []const u8) WriteError!usize {
-        return @errorCast(runtime.vtable.pwrite(runtime.ctx, file, buffer, -1));
+    pub fn write(file: File, runtime: Runtime, buffer: []const u8) *AnyWriteHandle {
+        return runtime.vtable.pwrite(runtime.ctx, file, buffer, -1);
     }
 
     pub const PWriteError = fs.File.PWriteError;
 
-    pub fn pwrite(file: File, runtime: Runtime, buffer: []const u8, offset: std.posix.off_t) PWriteError!usize {
+    pub fn pwrite(file: File, runtime: Runtime, buffer: []const u8, offset: std.posix.off_t) *AnyWriteHandle {
         return runtime.vtable.pwrite(runtime.ctx, file, buffer, offset);
-    }
-
-    pub fn writeAll(file: File, runtime: Runtime, bytes: []const u8) WriteError!void {
-        var index: usize = 0;
-        while (index < bytes.len) {
-            index += try runtime.vtable.write(runtime.ctx, file, bytes[index..]);
-        }
-    }
-
-    pub fn readAll(file: File, runtime: Runtime, buffer: []u8) ReadError!usize {
-        var index: usize = 0;
-        while (index != buffer.len) {
-            const amt = try file.read(runtime, buffer[index..]);
-            if (amt == 0) break;
-            index += amt;
-        }
-        return index;
     }
 };
 

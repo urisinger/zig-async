@@ -46,8 +46,13 @@ pub const VTable = struct {
     //createFile: *const fn (global_ctx: ?*anyopaque, executer: Executer, path: []const u8, flags: File.CreateFlags) File.OpenError!File,
     openFile: *const fn (global_ctx: ?*anyopaque, executer: Executer, path: []const u8, flags: File.OpenFlags) File.OpenError!File,
     closeFile: *const fn (global_ctx: ?*anyopaque, executer: Executer, File) void,
-    pread: *const fn (global_ctx: ?*anyopaque, executer: Executer, file: File, buffer: []u8, offset: std.posix.off_t) File.PReadError!usize,
-    pwrite: *const fn (global_ctx: ?*anyopaque, executer: Executer, file: File, buffer: []const u8, offset: std.posix.off_t) File.PWriteError!usize,
+
+    pread: *const fn (global_ctx: ?*anyopaque, executer: Executer, file: File, buffer: []u8, offset: std.posix.off_t) *File.AnyReadHandle,
+    awaitRead: *const fn (global_ctx: ?*anyopaque, executer: Executer, handle: *File.AnyReadHandle) File.PReadError!usize,
+
+    pwrite: *const fn (global_ctx: ?*anyopaque, executer: Executer, file: File, buffer: []const u8, offset: std.posix.off_t) *File.AnyWriteHandle,
+    awaitWrite: *const fn (global_ctx: ?*anyopaque, executer: Executer, handle: *File.AnyWriteHandle) File.PWriteError!usize,
+
     sleep: *const fn (global_ctx: ?*anyopaque, executer: Executer, timestamp: u64) void,
 };
 ctx: ?*anyopaque,

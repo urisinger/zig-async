@@ -12,6 +12,7 @@ const log = std.log.scoped(.Fibers);
 const assert = std.debug.assert;
 
 const Fibers = @This();
+// 10MB
 const stack_size = 1024 * 1024 * 10;
 const page_size = std.heap.pageSize();
 const page_align = Alignment.fromByteUnits(page_size);
@@ -52,7 +53,9 @@ const rt_vtable: Runtime.VTable = .{
     .openFile = openFile,
     .closeFile = closeFile,
     .pread = pread,
+    .awaitRead = awaitRead,
     .pwrite = pwrite,
+    .awaitWrite = awaitWrite,
     .sleep = sleep,
 };
 
@@ -740,9 +743,10 @@ fn wake(ctx: ?*anyopaque, waker: *anyopaque) void {
     const task: *Task.Detached = @alignCast(@ptrCast(waker));
 
     const t = Thread.current();
-    t.push(task);
-
-    _ = task.state.cmpxchgStrong(.Idle, .Queued, .acq_rel, .acquire);
+    const old_state = task.state.cmpxchgStrong(.Idle, .Queued, .acq_rel, .acquire);
+    if (old_state == null) {
+        t.push(task);
+    }
 }
 
 fn getWaker(ctx: ?*anyopaque) *anyopaque {
@@ -771,14 +775,24 @@ fn closeFile(ctx: ?*anyopaque, file: Runtime.File) void {
     rt.reactor.vtable.closeFile(rt.reactor.ctx, rt.executer(), file);
 }
 
-fn pread(ctx: ?*anyopaque, file: Runtime.File, buffer: []u8, offset: std.posix.off_t) Runtime.File.PReadError!usize {
+fn pread(ctx: ?*anyopaque, file: Runtime.File, buffer: []u8, offset: std.posix.off_t) *Runtime.File.AnyReadHandle {
     const rt: *Fibers = @alignCast(@ptrCast(ctx));
     return rt.reactor.vtable.pread(rt.reactor.ctx, rt.executer(), file, buffer, offset);
 }
 
-fn pwrite(ctx: ?*anyopaque, file: Runtime.File, buffer: []const u8, offset: std.posix.off_t) Runtime.File.PWriteError!usize {
+fn awaitRead(ctx: ?*anyopaque, handle: *Runtime.File.AnyReadHandle) Runtime.File.PReadError!usize {
+    const rt: *Fibers = @alignCast(@ptrCast(ctx));
+    return rt.reactor.vtable.awaitRead(rt.reactor.ctx, rt.executer(), handle);
+}
+
+fn pwrite(ctx: ?*anyopaque, file: Runtime.File, buffer: []const u8, offset: std.posix.off_t) *Runtime.File.AnyWriteHandle {
     const rt: *Fibers = @alignCast(@ptrCast(ctx));
     return rt.reactor.vtable.pwrite(rt.reactor.ctx, rt.executer(), file, buffer, offset);
+}
+
+fn awaitWrite(ctx: ?*anyopaque, handle: *Runtime.File.AnyWriteHandle) Runtime.File.PWriteError!usize {
+    const rt: *Fibers = @alignCast(@ptrCast(ctx));
+    return rt.reactor.vtable.awaitWrite(rt.reactor.ctx, rt.executer(), handle);
 }
 
 fn sleep(ctx: ?*anyopaque, ms: u64) void {

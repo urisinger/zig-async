@@ -70,16 +70,23 @@ pub fn run3(rt: Runtime) usize {
     log.info("future 3 running", .{});
 
     const file = rt.open("/dev/random", .{ .mode = .read_only }) catch unreachable;
-    var res: [10]u8 = undefined;
-    @memset(&res, 1);
-    const read = file.read(rt, &res) catch return 0;
+    const read_count = 10;
+    const read_size = 100;
+    var res: [read_count][read_size]u8 = undefined;
+    var read_handles: [read_count]*Runtime.File.AnyReadHandle = undefined;
+    var read_sum: usize = 0;
+    for (0..read_count) |i| {
+        read_handles[i] = file.read(rt, &res[i]);
+    }
+    for (0..read_count) |i| {
+        const read = read_handles[i].@"await"(rt) catch return 0;
+        log.info("read: {} bytes", .{read});
+        read_sum += read;
+    }
 
     file.close(rt);
 
-    log.info("read: {} bytes", .{read});
-
-    std.log.info("h", .{});
-    return read;
+    return read_sum;
 }
 
 pub fn run4(rt: Runtime) void {
