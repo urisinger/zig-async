@@ -6,7 +6,6 @@ const Alignment = std.mem.Alignment;
 
 const Runtime = @import("../Runtime.zig");
 const Reactor = @import("../Reactor.zig");
-const types = @import("../utils/types.zig");
 
 const log = std.log.scoped(.Fibers);
 const assert = std.debug.assert;
@@ -111,7 +110,6 @@ pub fn init(allocator: std.mem.Allocator, reactor: Reactor) !*Fibers {
 
 pub fn deinit(self: *Fibers) void {
     // Signal shutdown to all threads
-
     self.shutdown.requested.store(true, .release);
 
     self.shutdown.mutex.lock();
@@ -192,12 +190,12 @@ fn contextSwitch(old_ctx: *Context, new_ctx: *const Context) void {
 }
 
 fn reschedule(rt: *Fibers, task: *Task.Detached) void {
-    if (task.state.cmpxchgStrong(.Idle, .Queued, .acq_rel, .acquire) == null) {
+    if (task.state.cmpxchgStrong(.Idle, .Queued, .acq_rel, .acquire) == null and !task.completed.load(.acquire)) {
         rt.schedule(task);
         return;
     }
 
-    _ = task.state.cmpxchgStrong(.Running, .Rerun, .acq_rel, .acquire);
+    _ = task.state.store(.Rerun, .release);
 }
 
 fn schedule(rt: *Fibers, task: *Task.Detached) void {
@@ -230,14 +228,15 @@ const Task = union(enum) {
 
         state: std.atomic.Value(TaskState),
 
+        completed: std.atomic.Value(bool),
+
         waiter: std.atomic.Value(?*Detached),
 
         const TaskState = enum(u8) {
-            Idle,
-            Queued,
-            Running,
-            Rerun,
-            Completed,
+            Idle = 0,
+            Queued = 1,
+            Running = 2,
+            Rerun = 3,
         };
 
         pub fn init(
@@ -310,6 +309,7 @@ const Task = union(enum) {
                 .result_alignment = result_alignment,
                 .state = .init(.Queued),
                 .waiter = .init(null),
+                .completed = .init(false),
             };
 
             return task;
@@ -320,7 +320,7 @@ const Task = union(enum) {
             const thread = Thread.current();
             const rt = thread.rt;
 
-            _ = task.state.store(.Completed, .release);
+            _ = task.completed.store(true, .release);
 
             if (task.waiter.load(.acquire)) |w| {
                 rt.reschedule(w);
@@ -504,8 +504,8 @@ const Thread = struct {
 
         while (true) {
             while (thread.pop()) |t| {
-                const old_state = t.state.cmpxchgStrong(.Queued, .Running, .acq_rel, .acquire);
-                if (old_state == .Completed) {
+                _ = t.state.cmpxchgStrong(.Queued, .Running, .acq_rel, .acquire);
+                if (t.completed.load(.acquire)) {
                     continue;
                 }
                 thread.current_task = t;
@@ -515,9 +515,9 @@ const Thread = struct {
                 contextSwitch(&Thread.current().idle_context, &t.fiber.ctx);
                 const new_state = t.state.cmpxchgStrong(.Running, .Idle, .acq_rel, .acquire);
 
-                if (new_state == .Rerun) {
+                if (new_state == .Rerun and !t.completed.load(.acquire)) {
                     t.state.store(.Queued, .release);
-                    thread.push(t);
+                    rt.reschedule(t);
                 }
             }
 
@@ -592,7 +592,7 @@ fn joinTask(ctx: ?*anyopaque, handle: *Runtime.AnySpawnHandle, result: []u8) voi
 
     task.waiter.store(Thread.current().current_task.?, .release);
 
-    while (task.state.load(.acquire) != .Completed) {
+    while (!task.completed.load(.acquire)) {
         Task.yeild(Task.current());
     }
 
@@ -733,6 +733,8 @@ fn wake(ctx: ?*anyopaque, waker: *anyopaque) void {
     const task: *Task.Detached = @alignCast(@ptrCast(waker));
 
     const t = Thread.current();
+
+    // If the task isnt already queued or set to rerun, queue it
     const old_state = task.state.cmpxchgStrong(.Idle, .Queued, .acq_rel, .acquire);
     if (old_state == null) {
         t.push(task);

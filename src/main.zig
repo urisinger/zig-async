@@ -26,6 +26,7 @@ pub fn run(rt: Runtime) i32 {
         var fu1: Future(sleep) = .init(.{rt});
         var fu2: Future(write) = .init(.{rt});
         var fu3: Future(read) = .init(.{rt});
+        // Join just waits for all the tasks to finish.
         const result = rt.join(.{ &fu1, &fu2, &fu3 });
         log.info("result: {any}", .{result});
     }
@@ -34,6 +35,7 @@ pub fn run(rt: Runtime) i32 {
         var fu1: Future(sleep) = .init(.{rt});
         var fu2: Future(write) = .init(.{rt});
         var fu3: Future(read) = .init(.{rt});
+        // Select is a bit more complicated,
         const result = rt.select(.{ &fu1, &fu2, &fu3 });
         log.info("result: {}", .{result});
     }
@@ -45,7 +47,6 @@ pub fn run(rt: Runtime) i32 {
 pub fn sleep(rt: Runtime) i32 {
     log.info("future 1 running", .{});
     const handle1 = rt.spawn(write, .{rt});
-    rt.sleep(1000);
 
     const handle2 = rt.spawn(read, .{rt});
     _ = handle1.join(rt);
@@ -61,6 +62,7 @@ pub fn write(rt: Runtime) i32 {
     var res: [write_count][write_size]u8 = undefined;
     var write_handles: [write_count]*Runtime.File.AnyWriteHandle = undefined;
     var write_sum: usize = 0;
+    log.info("writing", .{});
     for (0..write_count) |i| {
         write_handles[i] = file.write(rt, &res[i]);
     }
@@ -83,6 +85,7 @@ pub fn read(rt: Runtime) usize {
     var res: [read_count][read_size]u8 = undefined;
     var read_handles: [read_count]*Runtime.File.AnyReadHandle = undefined;
     var read_sum: usize = 0;
+    log.info("reading", .{});
     for (0..read_count) |i| {
         read_handles[i] = file.read(rt, &res[i]);
     }

@@ -1,7 +1,6 @@
 const std = @import("std");
 const Runtime = @import("../Runtime.zig");
 const Reactor = @import("../Reactor.zig");
-const TaggedPtr = @import("../utils/types.zig").TaggedPtr;
 
 const log = std.log.scoped(.EventLoop);
 
