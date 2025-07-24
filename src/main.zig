@@ -7,22 +7,7 @@ const Uring = @import("Reactors/Uring/Uring.zig");
 
 const os = std.os;
 
-// Function to manage CTRL + C
-fn sigintHandler(sig: c_int) callconv(.C) void {
-    _ = sig;
-    std.debug.print("SIGINT received\n", .{});
-}
-
 pub fn main() !void {
-    const act = os.linux.Sigaction{
-        .handler = .{ .handler = sigintHandler },
-        .mask = os.linux.empty_sigset,
-        .flags = 0,
-    };
-
-    if (os.linux.sigaction(os.linux.SIG.INT, &act, null) != 0) {
-        return error.SignalHandlerError;
-    }
     var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer std.debug.assert(gpa.deinit() == .ok);
 
@@ -34,16 +19,63 @@ pub fn main() !void {
 
     const rt = fibers.runtime();
 
-    _ = rt.spawn(run, .{rt});
+    const handle = rt.spawn(run, .{ rt, allocator });
+
+    const stdin = std.io.getStdIn().reader();
+    var buffer: [1024]u8 = undefined;
+
+    while (true) {
+        const result = try stdin.readUntilDelimiter(&buffer, '\n');
+
+        if (std.mem.eql(u8, result, "stop")) {
+            log.info("stopping", .{});
+            handle.cancel(rt);
+            break;
+        }
+    }
+    log.info("stopped", .{});
 }
 
-pub const Client = struct {
-    socket: Runtime.Socket,
-    buffer: [1024]u8,
-};
+pub fn test1(rt: Runtime, sleep_amount: u64) void {
+    const read_bytes = 10;
+    const num_reads = 10;
+    var read_buffers: [num_reads][read_bytes]u8 = undefined;
+    var read_handles: [num_reads]*Runtime.File.AnyReadHandle = undefined;
+
+    const file: Runtime.File = rt.open("/dev/urandom", .{ .mode = .read_only }) catch |err| {
+        log.err("open error: {any}", .{err});
+        return;
+    };
+
+    rt.sleep(sleep_amount) catch |err| {
+        log.err("sleep error: {any}", .{err});
+        return;
+    };
+
+    log.info("sleeping for {d}ms", .{sleep_amount});
+
+    for (0..num_reads) |i| {
+        read_handles[i] = file.read(rt, &read_buffers[i]);
+    }
+
+    for (read_handles) |handle| {
+        const result = handle.@"await"(rt) catch |err| {
+            log.err("read error: {any}", .{err});
+            return;
+        };
+        log.info("read {d} bytes", .{result});
+    }
+}
 
 // Select style api.
-pub fn run(rt: Runtime) i32 {
+pub fn run(rt: Runtime, allocator: std.mem.Allocator) i32 {
+    var fut1 = Future(test1).init(.{ rt, 1000 });
+    var fut2 = Future(test1).init(.{ rt, 100 });
+
+    const result = rt.select(.{ &fut2, &fut1 });
+
+    log.info("result: {any}", .{result});
+
     const socket = rt.createSocket(.ipv4, .tcp) catch |err| {
         log.err("create socket error: {any}", .{err});
         return 1;
@@ -64,12 +96,29 @@ pub fn run(rt: Runtime) i32 {
         return 1;
     };
 
+    var tasks = std.ArrayList(Runtime.SpawnHandle(void)).init(allocator);
+    defer tasks.deinit();
+
     while (true) {
         const accept = socket.accept(rt).@"await"(rt) catch |err| {
             log.err("accept error: {any}", .{err});
-            continue;
+            break;
         };
-        _ = rt.spawn(client_task, .{ rt, accept });
+        const task = rt.spawn(client_task, .{ rt, accept });
+        tasks.append(task) catch |err| {
+            log.err("spawn error: {any}", .{err});
+            break;
+        };
+    }
+
+    for (tasks.items) |task| {
+        task.cancel(rt);
+    }
+
+    for (tasks.items) |task| {
+        task.join(rt) catch {
+            return 0;
+        };
     }
 
     return 0;

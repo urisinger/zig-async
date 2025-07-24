@@ -2,6 +2,7 @@ const std = @import("std");
 const Runtime = @import("Runtime.zig");
 const File = @import("Runtime.zig").File;
 const Socket = @import("Runtime.zig").Socket;
+const Cancelable = @import("Runtime.zig").Cancelable;
 
 const fs = std.fs;
 
@@ -10,7 +11,7 @@ pub const Executer = struct {
         getThreadContext: *const fn (ctx: ?*anyopaque) ?*anyopaque,
         getWaker: *const fn (ctx: ?*anyopaque) *anyopaque,
         wake: *const fn (ctx: ?*anyopaque, waker: *anyopaque) void,
-        @"suspend": *const fn (ctx: ?*anyopaque) void,
+        @"suspend": *const fn (ctx: ?*anyopaque) bool,
     };
 
     vtable: *const Executer.VTable,
@@ -28,8 +29,8 @@ pub const Executer = struct {
         self.vtable.wake(self.ctx, waker);
     }
 
-    pub fn @"suspend"(self: Executer) void {
-        self.vtable.@"suspend"(self.ctx);
+    pub fn @"suspend"(self: Executer) bool {
+        return self.vtable.@"suspend"(self.ctx);
     }
 };
 
@@ -47,6 +48,8 @@ pub const VTable = struct {
     //createFile: *const fn (global_ctx: ?*anyopaque, executer: Executer, path: []const u8, flags: File.CreateFlags) File.OpenError!File,
     openFile: *const fn (global_ctx: ?*anyopaque, executer: Executer, path: []const u8, flags: File.OpenFlags) File.OpenError!File,
     closeFile: *const fn (global_ctx: ?*anyopaque, executer: Executer, File) void,
+
+    getStdIn: *const fn (global_ctx: ?*anyopaque, executer: Executer) File,
 
     pread: *const fn (global_ctx: ?*anyopaque, executer: Executer, file: File, buffer: []u8, offset: std.posix.off_t) *File.AnyReadHandle,
     awaitRead: *const fn (global_ctx: ?*anyopaque, executer: Executer, handle: *File.AnyReadHandle) File.PReadError!usize,
@@ -72,7 +75,7 @@ pub const VTable = struct {
     recv: *const fn (global_ctx: ?*anyopaque, executer: Executer, socket: Socket, buffer: []u8, flags: Socket.RecvFlags) *Socket.AnyRecvHandle,
     awaitRecv: *const fn (global_ctx: ?*anyopaque, executer: Executer, handle: *Socket.AnyRecvHandle) Socket.RecvError!usize,
 
-    sleep: *const fn (global_ctx: ?*anyopaque, executer: Executer, timestamp: u64) void,
+    sleep: *const fn (global_ctx: ?*anyopaque, executer: Executer, timestamp: u64) Cancelable!void,
 };
 ctx: ?*anyopaque,
 

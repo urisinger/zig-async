@@ -31,6 +31,12 @@ pub fn openFile(ctx: ?*anyopaque, exec: Reactor.Executer, path: []const u8, flag
     };
 }
 
+pub fn getStdIn(ctx: ?*anyopaque, exec: Reactor.Executer) Runtime.File {
+    _ = ctx;
+    _ = exec;
+    return .{ .handle = std.os.linux.STDIN_FILENO };
+}
+
 // Async file read
 pub fn pread(ctx: ?*anyopaque, exec: Reactor.Executer, file: Runtime.File, buffer: []u8, offset: std.posix.off_t) *Runtime.File.AnyReadHandle {
     _ = ctx;
@@ -63,7 +69,9 @@ pub fn awaitRead(ctx: ?*anyopaque, exec: Reactor.Executer, handle: *Runtime.File
     sqe_op.waker = exec.getWaker();
 
     while (!sqe_op.has_result) {
-        exec.@"suspend"();
+        if (exec.@"suspend"()) {
+            return error.Canceled;
+        }
     }
 
     switch (errno(sqe_op.result)) {
@@ -113,7 +121,9 @@ pub fn awaitWrite(ctx: ?*anyopaque, exec: Reactor.Executer, handle: *Runtime.Fil
 
     // Suspend until the operation completes
     while (!sqe_op.has_result) {
-        exec.@"suspend"();
+        if (exec.@"suspend"()) {
+            return error.Canceled;
+        }
     }
 
     switch (errno(sqe_op.result)) {

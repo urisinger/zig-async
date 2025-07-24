@@ -25,21 +25,26 @@ pub const VTable = struct {
         start: *const fn (context: *const anyopaque, result: *anyopaque) void,
     ) *AnySpawnHandle,
 
-    joinTask: *const fn (ctx: ?*anyopaque, task: *AnySpawnHandle, result: []u8) void,
+    cancel: *const fn (ctx: ?*anyopaque, task: *AnySpawnHandle) void,
+
+    joinTask: *const fn (ctx: ?*anyopaque, task: *AnySpawnHandle, result: []u8) Cancelable!void,
 
     /// Runs all the futures in parallel, and waits for them all to finish.
     ///
     /// Thread-safe.
-    join: *const fn (ctx: ?*anyopaque, futures: []const AnyFuture) void,
+    join: *const fn (ctx: ?*anyopaque, futures: []const AnyFuture) Cancelable!void,
     /// Runs all the futures in parallel, and waits for them all to finish.
     /// Its possible that two futures finish at the same time, in which case
     /// the implementation decides which one to return.
     ///
     /// Thread-safe.
-    select: *const fn (ctx: ?*anyopaque, futures: []const AnyFuture) usize,
+    select: *const fn (ctx: ?*anyopaque, futures: []const AnyFuture) Cancelable!usize,
 
     openFile: *const fn (ctx: ?*anyopaque, path: []const u8, flags: File.OpenFlags) File.OpenError!File,
     closeFile: *const fn (ctx: ?*anyopaque, file: File) void,
+
+    getStdIn: *const fn (ctx: ?*anyopaque) File,
+
     pread: *const fn (ctx: ?*anyopaque, file: File, buffer: []u8, offset: std.posix.off_t) *File.AnyReadHandle,
     awaitRead: *const fn (ctx: ?*anyopaque, handle: *File.AnyReadHandle) File.PReadError!usize,
     pwrite: *const fn (ctx: ?*anyopaque, file: File, buffer: []const u8, offset: std.posix.off_t) *File.AnyWriteHandle,
@@ -63,15 +68,17 @@ pub const VTable = struct {
     recv: *const fn (ctx: ?*anyopaque, socket: Socket, buffer: []u8, flags: Socket.RecvFlags) *Socket.AnyRecvHandle,
     awaitRecv: *const fn (ctx: ?*anyopaque, handle: *Socket.AnyRecvHandle) Socket.RecvError!usize,
 
-    sleep: *const fn (ctx: ?*anyopaque, ms: u64) void,
+    sleep: *const fn (ctx: ?*anyopaque, ms: u64) Cancelable!void,
+};
+
+pub const Cancelable = error{
+    Canceled,
 };
 
 pub const Socket = struct {
     handle: Handle,
 
     pub const Handle = std.posix.socket_t;
-
-    pub const AcceptError = std.posix.AcceptError;
 
     pub const Domain = enum {
         ipv4,
@@ -85,11 +92,12 @@ pub const Socket = struct {
         default,
     };
 
-    pub const CreateError = std.posix.SocketError;
+    pub const AcceptError = Cancelable || std.posix.AcceptError;
+    pub const CreateError = Cancelable || std.posix.SocketError;
     pub const BindError = std.posix.BindError;
-    pub const ConnectError = std.posix.ConnectError;
-    pub const SendError = std.posix.SendError;
-    pub const RecvError = std.posix.RecvFromError;
+    pub const ConnectError = Cancelable || std.posix.ConnectError;
+    pub const SendError = Cancelable || std.posix.SendError;
+    pub const RecvError = Cancelable || std.posix.RecvFromError;
     pub const ListenError = std.posix.ListenError;
 
     pub const SendFlags = struct {
@@ -164,12 +172,6 @@ pub const Socket = struct {
         }
     };
 
-    pub const ReadError = std.net.Stream.ReadError;
-    pub const AnyReadHandle = opaque {
-        pub fn @"await"(self: *AnyReadHandle, runtime: Runtime) ReadError!usize {
-            return runtime.vtable.awaitRead(runtime.ctx, self);
-        }
-    };
     pub const Address = std.posix.sockaddr;
 };
 
@@ -195,31 +197,31 @@ pub const File = struct {
     pub const OpenFlags = fs.File.OpenFlags;
     pub const CreateFlags = fs.File.CreateFlags;
 
-    pub const OpenError = fs.File.OpenError;
+    pub const OpenError = Cancelable || fs.File.OpenError;
 
     pub fn close(file: File, runtime: Runtime) void {
         return runtime.vtable.closeFile(runtime.ctx, file);
     }
 
-    pub const ReadError = fs.File.ReadError;
+    pub const ReadError = Cancelable || fs.File.ReadError;
 
     pub fn read(file: File, runtime: Runtime, buffer: []u8) *AnyReadHandle {
         return runtime.vtable.pread(runtime.ctx, file, buffer, -1);
     }
 
-    pub const PReadError = fs.File.PReadError;
+    pub const PReadError = Cancelable || fs.File.PReadError;
 
     pub fn pread(file: File, runtime: Runtime, buffer: []u8, offset: std.posix.off_t) PReadError!usize {
         return runtime.vtable.pread(runtime.ctx, file, buffer, offset);
     }
 
-    pub const WriteError = fs.File.WriteError;
+    pub const WriteError = Cancelable || fs.File.WriteError;
 
     pub fn write(file: File, runtime: Runtime, buffer: []const u8) *AnyWriteHandle {
         return runtime.vtable.pwrite(runtime.ctx, file, buffer, -1);
     }
 
-    pub const PWriteError = fs.File.PWriteError;
+    pub const PWriteError = Cancelable || fs.File.PWriteError;
 
     pub fn pwrite(file: File, runtime: Runtime, buffer: []const u8, offset: std.posix.off_t) *AnyWriteHandle {
         return runtime.vtable.pwrite(runtime.ctx, file, buffer, offset);
@@ -261,25 +263,29 @@ pub fn Future(comptime Fn: anytype) type {
     };
 }
 
-pub fn SpawnHandle(comptime Fn: anytype) type {
-    const fn_info = @typeInfo(@TypeOf(Fn)).@"fn";
-    const Ret = fn_info.return_type.?;
-
+pub fn SpawnHandle(T: type) type {
     return struct {
         const Self = @This();
         handle: *AnySpawnHandle,
 
-        pub fn join(self: *const @This(), runtime: Runtime) Ret {
-            var result: Ret = undefined;
-            runtime.vtable.joinTask(runtime.ctx, self.handle, if (@sizeOf(Ret) == 0) &.{} else @ptrCast((&result)[0..1]));
+        pub fn join(self: *const @This(), runtime: Runtime) Cancelable!T {
+            var result: T = undefined;
+            try runtime.vtable.joinTask(
+                runtime.ctx,
+                self.handle,
+                if (@sizeOf(T) == 0) &.{} else @ptrCast((&result)[0..1]),
+            );
             return result;
+        }
+        pub fn cancel(self: *const @This(), runtime: Runtime) void {
+            runtime.vtable.cancel(runtime.ctx, self.handle);
         }
     };
 }
 
 /// Calls `function` with `args` asynchronously. The resource cleans itself up
 /// when the function returns. Does not support await, cancel, or a return value.
-pub inline fn spawn(runtime: Runtime, function: anytype, args: std.meta.ArgsTuple(@TypeOf(function))) SpawnHandle(function) {
+pub inline fn spawn(runtime: Runtime, function: anytype, args: std.meta.ArgsTuple(@TypeOf(function))) SpawnHandle(@typeInfo(@TypeOf(function)).@"fn".return_type.?) {
     const Args = @TypeOf(args);
     const Ret = @typeInfo(@TypeOf(function)).@"fn".return_type.?;
     const TypeErased = struct {
@@ -326,14 +332,14 @@ pub fn JoinResult(S: anytype) type {
 
 /// `s` is a struct with every field a `*Future(T)`, where `T` can be any type,
 /// and can be different for each field.
-pub inline fn join(runtime: Runtime, s: anytype) JoinResult(@TypeOf(s)) {
+pub inline fn join(runtime: Runtime, s: anytype) Cancelable!JoinResult(@TypeOf(s)) {
     const fields = @typeInfo(@TypeOf(s)).@"struct".fields;
     var futures: [fields.len]AnyFuture = undefined;
     inline for (fields, &futures) |field, *any_future| {
         const future = @field(s, field.name);
         any_future.* = future.any_future();
     }
-    runtime.vtable.join(runtime.ctx, &futures);
+    try runtime.vtable.join(runtime.ctx, &futures);
 
     var result: JoinResult(@TypeOf(s)) = undefined;
     inline for (fields) |field| {
@@ -367,7 +373,7 @@ pub fn SelectUnion(S: type) type {
 
 /// `s` is a struct with every field a `*Future(T)`, where `T` can be any type,
 /// and can be different for each field.
-pub inline fn select(runtime: Runtime, s: anytype) SelectUnion(@TypeOf(s)) {
+pub inline fn select(runtime: Runtime, s: anytype) Cancelable!SelectUnion(@TypeOf(s)) {
     const U = SelectUnion(@TypeOf(s));
     const S = @TypeOf(s);
     const fields = @typeInfo(S).@"struct".fields;
@@ -376,7 +382,7 @@ pub inline fn select(runtime: Runtime, s: anytype) SelectUnion(@TypeOf(s)) {
         const future = @field(s, field.name);
         any_future.* = future.any_future();
     }
-    switch (runtime.vtable.select(runtime.ctx, &futures)) {
+    switch (try runtime.vtable.select(runtime.ctx, &futures)) {
         inline 0...(fields.len - 1) => |selected_index| {
             const field_name = fields[selected_index].name;
             return @unionInit(U, field_name, @field(s, field_name).result);
@@ -385,7 +391,7 @@ pub inline fn select(runtime: Runtime, s: anytype) SelectUnion(@TypeOf(s)) {
     }
 }
 
-pub inline fn selectAny(runtime: Runtime, futures: []const AnyFuture) usize {
+pub inline fn selectAny(runtime: Runtime, futures: []const AnyFuture) Cancelable!usize {
     return runtime.vtable.select(runtime.ctx, futures);
 }
 
@@ -393,8 +399,8 @@ pub fn open(runtime: Runtime, path: []const u8, flags: File.OpenFlags) !File {
     return runtime.vtable.openFile(runtime.ctx, path, flags);
 }
 
-pub fn sleep(runtime: Runtime, ms: u64) void {
-    runtime.vtable.sleep(runtime.ctx, ms);
+pub fn sleep(runtime: Runtime, ms: u64) Cancelable!void {
+    try runtime.vtable.sleep(runtime.ctx, ms);
 }
 
 pub fn createSocket(runtime: Runtime, domain: Socket.Domain, protocol: Socket.Protocol) Socket.CreateError!Socket {

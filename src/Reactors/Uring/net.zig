@@ -58,7 +58,9 @@ pub fn awaitCreateSocket(ctx: ?*anyopaque, exec: Reactor.Executer, handle: *Runt
     op.waker = exec.getWaker();
 
     while (!op.has_result) {
-        exec.@"suspend"();
+        if (exec.@"suspend"()) {
+            return error.Canceled;
+        }
     }
 
     const socket: Runtime.Socket = .{
@@ -131,7 +133,9 @@ pub fn awaitConnect(ctx: ?*anyopaque, exec: Reactor.Executer, handle: *Runtime.S
     op.waker = exec.getWaker();
 
     while (!op.has_result) {
-        exec.@"suspend"();
+        if (exec.@"suspend"()) {
+            return error.Canceled;
+        }
     }
     switch (errno(op.result)) {
         .SUCCESS => return,
@@ -193,7 +197,9 @@ pub fn awaitAccept(ctx: ?*anyopaque, exec: Reactor.Executer, handle: *Runtime.So
     op.waker = exec.getWaker();
 
     while (!op.has_result) {
-        exec.@"suspend"();
+        if (exec.@"suspend"()) {
+            return error.Canceled;
+        }
     }
 
     switch (errno(op.result)) {
@@ -255,7 +261,9 @@ pub fn awaitSend(ctx: ?*anyopaque, exec: Reactor.Executer, handle: *Runtime.Sock
     op.waker = exec.getWaker();
 
     while (!op.has_result) {
-        exec.@"suspend"();
+        if (exec.@"suspend"()) {
+            return error.Canceled;
+        }
     }
 
     switch (errno(op.result)) {
@@ -320,7 +328,9 @@ pub fn awaitRecv(ctx: ?*anyopaque, exec: Reactor.Executer, handle: *Runtime.Sock
     op.waker = exec.getWaker();
 
     while (!op.has_result) {
-        exec.@"suspend"();
+        if (exec.@"suspend"()) {
+            return error.Canceled;
+        }
     }
 
     switch (errno(op.result)) {

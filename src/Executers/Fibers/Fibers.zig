@@ -8,6 +8,7 @@ const Runtime = @import("../../Runtime.zig");
 const Reactor = @import("../../Reactor.zig");
 const Context = @import("./context.zig").Context;
 const contextSwitch = @import("./context.zig").contextSwitch;
+const Cancelable = Runtime.Cancelable;
 
 const log = std.log.scoped(.Fibers);
 const assert = std.debug.assert;
@@ -47,6 +48,7 @@ shutdown: struct {
 reactor: Reactor,
 const rt_vtable: Runtime.VTable = .{
     .spawn = spawn,
+    .cancel = cancel,
     .joinTask = joinTask,
     .select = select,
     .join = join,
@@ -72,6 +74,8 @@ const rt_vtable: Runtime.VTable = .{
     .awaitSend = awaitSend,
     .recv = recv,
     .awaitRecv = awaitRecv,
+
+    .getStdIn = getStdIn,
 };
 
 const exec_vtable: Reactor.Executer.VTable = .{
@@ -80,7 +84,6 @@ const exec_vtable: Reactor.Executer.VTable = .{
     .wake = wake,
     .@"suspend" = @"suspend",
 };
-
 pub fn init(allocator: std.mem.Allocator, reactor: Reactor) !*Fibers {
     const cpu_count = std.Thread.getCpuCount() catch 1;
     const threads = try allocator.alloc(Thread, cpu_count);
@@ -127,10 +130,11 @@ pub fn init(allocator: std.mem.Allocator, reactor: Reactor) !*Fibers {
 pub fn deinit(self: *Fibers) void {
     // Signal shutdown to all threads
     self.shutdown.requested.store(true, .release);
-
-    self.shutdown.mutex.lock();
-    self.shutdown.cond.wait(&self.shutdown.mutex);
-    self.shutdown.mutex.unlock();
+    if (self.shutdown.task_count.load(.acquire) > 0) {
+        self.shutdown.mutex.lock();
+        self.shutdown.cond.wait(&self.shutdown.mutex);
+        self.shutdown.mutex.unlock();
+    }
 
     // Wake up all threads so they can see the shutdown signal
     for (self.threads) |*thread| {
@@ -204,6 +208,7 @@ const Task = union(enum) {
         result_alignment: Alignment,
 
         state: std.atomic.Value(TaskState),
+        canceled: std.atomic.Value(bool),
 
         completed: std.atomic.Value(bool),
 
@@ -287,6 +292,7 @@ const Task = union(enum) {
                 .state = .init(.Queued),
                 .waiter = .init(null),
                 .completed = .init(false),
+                .canceled = .init(false),
             };
 
             return task;
@@ -323,6 +329,7 @@ const Task = union(enum) {
 
         waiter: Task,
         finished: bool = false,
+        canceled: bool = false,
 
         pub const Node = struct {
             task: Async,
@@ -391,7 +398,7 @@ const Task = union(enum) {
         }
     }
 
-    fn yeild(old_task: Task) void {
+    fn yeild(old_task: Task) bool {
         const old_fiber = old_task.fiber();
         const new_ctx = ctx: switch (old_task) {
             .detached => &Thread.current().idle_context,
@@ -401,6 +408,14 @@ const Task = union(enum) {
             },
         };
         contextSwitch(&old_fiber.ctx, new_ctx);
+        switch (old_task) {
+            .detached => |t| {
+                return t.canceled.load(.acquire);
+            },
+            .@"async" => |t| {
+                return t.canceled;
+            },
+        }
     }
 
     fn trampoline() callconv(.C) noreturn {
@@ -414,7 +429,7 @@ const Task = union(enum) {
             },
         }
 
-        task.yeild();
+        _ = task.yeild();
         unreachable;
     }
 };
@@ -562,14 +577,27 @@ fn spawn(
     return @ptrCast(task);
 }
 
-fn joinTask(ctx: ?*anyopaque, handle: *Runtime.AnySpawnHandle, result: []u8) void {
+fn cancel(ctx: ?*anyopaque, handle: *Runtime.AnySpawnHandle) void {
+    const rt: *Fibers = @alignCast(@ptrCast(ctx));
+    const task: *Task.Detached = @alignCast(@ptrCast(handle));
+    task.canceled.store(true, .release);
+    if (task.completed.load(.acquire)) {
+        log.info("task already completed", .{});
+        return;
+    }
+    rt.reschedule(task);
+}
+
+fn joinTask(ctx: ?*anyopaque, handle: *Runtime.AnySpawnHandle, result: []u8) Cancelable!void {
     _ = ctx;
     const task: *Task.Detached = @alignCast(@ptrCast(handle));
 
     task.waiter.store(Thread.current().current_task.?, .release);
 
     while (!task.completed.load(.acquire)) {
-        Task.yeild(Task.current());
+        if (Task.current().yeild()) {
+            return error.Canceled;
+        }
     }
 
     @memcpy(result, task.result_buf);
@@ -578,7 +606,7 @@ fn joinTask(ctx: ?*anyopaque, handle: *Runtime.AnySpawnHandle, result: []u8) voi
 fn select(
     ctx: ?*anyopaque,
     futures: []const Runtime.AnyFuture,
-) usize {
+) Cancelable!usize {
     _ = ctx;
     const me = Task.current();
 
@@ -624,7 +652,9 @@ fn select(
             node = current_node.next;
             index += 1;
         }
-        Task.yeild(me);
+        if (Task.current().yeild()) {
+            return error.Canceled;
+        }
     };
 
     // Clean up linked list
@@ -638,7 +668,7 @@ fn select(
     return result;
 }
 
-fn join(ctx: ?*anyopaque, futures: []const Runtime.AnyFuture) void {
+fn join(ctx: ?*anyopaque, futures: []const Runtime.AnyFuture) Cancelable!void {
     _ = ctx;
     const me = Task.current();
 
@@ -688,7 +718,9 @@ fn join(ctx: ?*anyopaque, futures: []const Runtime.AnyFuture) void {
             break;
         }
 
-        Task.yeild(me);
+        if (Task.current().yeild()) {
+            return error.Canceled;
+        }
     }
 
     // Clean up linked list and verify all tasks finished
@@ -728,9 +760,9 @@ fn getThreadContext(ctx: ?*anyopaque) ?*anyopaque {
 }
 
 /// simply set ourselves to blocking, this is similar to returning Poll::Pending in rust
-fn @"suspend"(ctx: ?*anyopaque) void {
+fn @"suspend"(ctx: ?*anyopaque) bool {
     _ = ctx;
-    Task.yeild(Task.current());
+    return Task.current().yeild();
 }
 
 fn openFile(ctx: ?*anyopaque, path: []const u8, flags: Runtime.File.OpenFlags) Runtime.File.OpenError!Runtime.File {
@@ -763,9 +795,9 @@ fn awaitWrite(ctx: ?*anyopaque, handle: *Runtime.File.AnyWriteHandle) Runtime.Fi
     return rt.reactor.vtable.awaitWrite(rt.reactor.ctx, rt.executer(), handle);
 }
 
-fn sleep(ctx: ?*anyopaque, ms: u64) void {
+fn sleep(ctx: ?*anyopaque, ms: u64) Cancelable!void {
     const rt: *Fibers = @alignCast(@ptrCast(ctx));
-    rt.reactor.vtable.sleep(rt.reactor.ctx, rt.executer(), ms);
+    try rt.reactor.vtable.sleep(rt.reactor.ctx, rt.executer(), ms);
 }
 
 fn createSocket(ctx: ?*anyopaque, domain: Runtime.Socket.Domain, protocol: Runtime.Socket.Protocol) *Runtime.Socket.AnyCreateHandle {
@@ -831,4 +863,9 @@ fn recv(ctx: ?*anyopaque, socket: Runtime.Socket, buffer: []u8, flags: Runtime.S
 fn awaitRecv(ctx: ?*anyopaque, handle: *Runtime.Socket.AnyRecvHandle) Runtime.Socket.RecvError!usize {
     const rt: *Fibers = @alignCast(@ptrCast(ctx));
     return rt.reactor.vtable.awaitRecv(rt.reactor.ctx, rt.executer(), handle);
+}
+
+fn getStdIn(ctx: ?*anyopaque) Runtime.File {
+    const rt: *Fibers = @alignCast(@ptrCast(ctx));
+    return rt.reactor.vtable.getStdIn(rt.reactor.ctx, rt.executer());
 }

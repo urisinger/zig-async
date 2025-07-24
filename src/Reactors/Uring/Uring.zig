@@ -8,6 +8,7 @@ const net = @import("./net.zig");
 
 const IoUring = std.os.linux.IoUring;
 const Allocator = std.mem.Allocator;
+const Cancelable = Runtime.Cancelable;
 
 const EventLoop = @This();
 
@@ -116,6 +117,7 @@ const vtable: Reactor.VTable = .{
     .awaitSend = net.awaitSend,
     .recv = net.recv,
     .awaitRecv = net.awaitRecv,
+    .getStdIn = fs.getStdIn,
 };
 
 pub fn reactor(el: *EventLoop) Reactor {
@@ -125,7 +127,7 @@ pub fn reactor(el: *EventLoop) Reactor {
     };
 }
 
-fn sleep(ctx: ?*anyopaque, exec: Reactor.Executer, ms: u64) void {
+fn sleep(ctx: ?*anyopaque, exec: Reactor.Executer, ms: u64) Cancelable!void {
     _ = ctx;
 
     const thread_ctx: *ThreadContext = @alignCast(@ptrCast(exec.getThreadContext()));
@@ -152,7 +154,9 @@ fn sleep(ctx: ?*anyopaque, exec: Reactor.Executer, ms: u64) void {
     sqe.user_data = @intFromPtr(op);
 
     while (true) {
-        exec.@"suspend"();
+        if (exec.@"suspend"()) {
+            return error.Canceled;
+        }
         if (op.has_result) {
             switch (errno(op.result)) {
                 .SUCCESS => {
