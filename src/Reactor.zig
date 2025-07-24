@@ -1,6 +1,7 @@
 const std = @import("std");
 const Runtime = @import("Runtime.zig");
 const File = @import("Runtime.zig").File;
+const Socket = @import("Runtime.zig").Socket;
 
 const fs = std.fs;
 
@@ -52,6 +53,24 @@ pub const VTable = struct {
 
     pwrite: *const fn (global_ctx: ?*anyopaque, executer: Executer, file: File, buffer: []const u8, offset: std.posix.off_t) *File.AnyWriteHandle,
     awaitWrite: *const fn (global_ctx: ?*anyopaque, executer: Executer, handle: *File.AnyWriteHandle) File.PWriteError!usize,
+
+    createSocket: *const fn (global_ctx: ?*anyopaque, executer: Executer, domain: Socket.Domain, protocol: Socket.Protocol) *Socket.AnyCreateHandle,
+    awaitCreateSocket: *const fn (global_ctx: ?*anyopaque, executer: Executer, handle: *Socket.AnyCreateHandle) Socket.CreateError!Socket,
+    closeSocket: *const fn (global_ctx: ?*anyopaque, executer: Executer, socket: Socket) void,
+
+    bind: *const fn (global_ctx: ?*anyopaque, executer: Executer, socket: Socket, address: *const Socket.Address, length: u32) Socket.BindError!void,
+    listen: *const fn (global_ctx: ?*anyopaque, executer: Executer, socket: Socket, backlog: u32) Socket.ListenError!void,
+
+    connect: *const fn (global_ctx: ?*anyopaque, executer: Executer, socket: Socket, address: *const Socket.Address) *Socket.AnyConnectHandle,
+    awaitConnect: *const fn (global_ctx: ?*anyopaque, executer: Executer, handle: *Socket.AnyConnectHandle) Socket.ConnectError!void,
+
+    accept: *const fn (global_ctx: ?*anyopaque, executer: Executer, socket: Socket) *Socket.AnyAcceptHandle,
+    awaitAccept: *const fn (global_ctx: ?*anyopaque, executer: Executer, handle: *Socket.AnyAcceptHandle) Socket.AcceptError!Socket,
+
+    send: *const fn (global_ctx: ?*anyopaque, executer: Executer, socket: Socket, buffer: []const u8, flags: Socket.SendFlags) *Socket.AnySendHandle,
+    awaitSend: *const fn (global_ctx: ?*anyopaque, executer: Executer, handle: *Socket.AnySendHandle) Socket.SendError!usize,
+    recv: *const fn (global_ctx: ?*anyopaque, executer: Executer, socket: Socket, buffer: []u8, flags: Socket.RecvFlags) *Socket.AnyRecvHandle,
+    awaitRecv: *const fn (global_ctx: ?*anyopaque, executer: Executer, handle: *Socket.AnyRecvHandle) Socket.RecvError!usize,
 
     sleep: *const fn (global_ctx: ?*anyopaque, executer: Executer, timestamp: u64) void,
 };

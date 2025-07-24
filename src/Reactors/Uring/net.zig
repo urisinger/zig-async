@@ -1,0 +1,344 @@
+const std = @import("std");
+
+const Runtime = @import("../../Runtime.zig");
+const Reactor = @import("../../Reactor.zig");
+
+const Uring = @import("./Uring.zig");
+const ThreadContext = Uring.ThreadContext;
+const Operation = Uring.Operation;
+const CreateError = Runtime.Socket.CreateError;
+const errno = Uring.errno;
+
+pub fn createSocket(ctx: ?*anyopaque, exec: Reactor.Executer, domain: Runtime.Socket.Domain, protocol: Runtime.Socket.Protocol) *Runtime.Socket.AnyCreateHandle {
+    _ = ctx;
+    const thread_ctx: *ThreadContext = @alignCast(@ptrCast(exec.getThreadContext()));
+
+    const sqe = thread_ctx.getSqe() catch {
+        @panic("failed to get sqe");
+    };
+    const op = thread_ctx.getOp() catch {
+        @panic("failed to get op");
+    };
+
+    op.* = .{
+        .waker = null,
+        .result = 0,
+        .has_result = false,
+    };
+
+    const domain_int: u32 = switch (domain) {
+        .ipv4 => std.os.linux.AF.INET,
+        .ipv6 => std.os.linux.AF.INET6,
+        .unix => std.os.linux.AF.UNIX,
+    };
+
+    const protocol_int: u32 = switch (protocol) {
+        .tcp => std.os.linux.IPPROTO.TCP,
+        .udp => std.os.linux.IPPROTO.UDP,
+        .default => std.os.linux.IPPROTO.IP,
+    };
+    const type_int: u32 = switch (protocol) {
+        .tcp => std.os.linux.SOCK.STREAM,
+        .udp => std.os.linux.SOCK.DGRAM,
+        .default => std.os.linux.SOCK.DGRAM,
+    };
+
+    sqe.prep_socket(domain_int, type_int, protocol_int, 0);
+    sqe.user_data = @intFromPtr(op);
+
+    return @ptrCast(op);
+}
+
+pub fn awaitCreateSocket(ctx: ?*anyopaque, exec: Reactor.Executer, handle: *Runtime.Socket.AnyCreateHandle) Runtime.Socket.CreateError!Runtime.Socket {
+    _ = ctx;
+    const thread_ctx: *ThreadContext = @alignCast(@ptrCast(exec.getThreadContext()));
+
+    const op: *Operation = @ptrCast(@alignCast(handle));
+    defer thread_ctx.destroyOp(op);
+    op.waker = exec.getWaker();
+
+    while (!op.has_result) {
+        exec.@"suspend"();
+    }
+
+    const socket: Runtime.Socket = .{
+        .handle = switch (errno(op.result)) {
+            .SUCCESS => @bitCast(op.result),
+            .ACCES => return error.PermissionDenied,
+            .AFNOSUPPORT => return error.AddressFamilyNotSupported,
+            .INVAL => return error.ProtocolFamilyNotAvailable,
+            .MFILE => return error.ProcessFdQuotaExceeded,
+            .NFILE => return error.SystemFdQuotaExceeded,
+            .NOBUFS => return error.SystemResources,
+            .NOMEM => return error.SystemResources,
+            .PROTONOSUPPORT => return error.ProtocolNotSupported,
+            .PROTOTYPE => return error.SocketTypeNotSupported,
+            else => |err| return std.posix.unexpectedErrno(err),
+        },
+    };
+
+    return socket;
+}
+
+pub fn closeSocket(ctx: ?*anyopaque, exec: Reactor.Executer, socket: Runtime.Socket) void {
+    _ = ctx;
+    _ = exec;
+    std.posix.close(socket.handle);
+}
+
+pub fn bind(ctx: ?*anyopaque, exec: Reactor.Executer, socket: Runtime.Socket, address: *const Runtime.Socket.Address, length: u32) Runtime.Socket.BindError!void {
+    _ = ctx;
+    _ = exec;
+    try std.posix.bind(socket.handle, address, length);
+}
+
+pub fn listen(ctx: ?*anyopaque, exec: Reactor.Executer, socket: Runtime.Socket, backlog: u32) Runtime.Socket.ListenError!void {
+    _ = ctx;
+    _ = exec;
+    try std.posix.listen(socket.handle, @truncate(backlog));
+}
+
+pub fn connect(ctx: ?*anyopaque, exec: Reactor.Executer, socket: Runtime.Socket, address: *const Runtime.Socket.Address) *Runtime.Socket.AnyConnectHandle {
+    _ = ctx;
+    const thread_ctx: *ThreadContext = @alignCast(@ptrCast(exec.getThreadContext()));
+
+    const sqe = thread_ctx.getSqe() catch {
+        @panic("failed to get sqe");
+    };
+    const op = thread_ctx.getOp() catch {
+        @panic("failed to get op");
+    };
+
+    op.* = .{
+        .waker = null,
+        .result = 0,
+        .has_result = false,
+    };
+
+    sqe.prep_connect(socket.handle, address, @sizeOf(Runtime.Socket.Address));
+    sqe.user_data = @intFromPtr(op);
+
+    return @ptrCast(op);
+}
+
+pub fn awaitConnect(ctx: ?*anyopaque, exec: Reactor.Executer, handle: *Runtime.Socket.AnyConnectHandle) Runtime.Socket.ConnectError!void {
+    _ = ctx;
+    const thread_ctx: *ThreadContext = @alignCast(@ptrCast(exec.getThreadContext()));
+
+    const op: *Operation = @ptrCast(@alignCast(handle));
+    defer thread_ctx.destroyOp(op);
+
+    op.waker = exec.getWaker();
+
+    while (!op.has_result) {
+        exec.@"suspend"();
+    }
+    switch (errno(op.result)) {
+        .SUCCESS => return,
+        .ACCES => return error.PermissionDenied,
+        .PERM => return error.PermissionDenied,
+        .ADDRINUSE => return error.AddressInUse,
+        .ADDRNOTAVAIL => return error.AddressNotAvailable,
+        .AFNOSUPPORT => return error.AddressFamilyNotSupported,
+        .AGAIN, .INPROGRESS => return error.WouldBlock,
+        .ALREADY => return error.ConnectionPending,
+        .BADF => unreachable, // sockfd is not a valid open file descriptor.
+        .CONNREFUSED => return error.ConnectionRefused,
+        .CONNRESET => return error.ConnectionResetByPeer,
+        .FAULT => unreachable, // The socket structure address is outside the user's address space.
+        .INTR => unreachable,
+        .ISCONN => unreachable, // The socket is already connected.
+        .HOSTUNREACH => return error.NetworkUnreachable,
+        .NETUNREACH => return error.NetworkUnreachable,
+        .NOTSOCK => unreachable, // The file descriptor sockfd does not refer to a socket.
+        .PROTOTYPE => unreachable, // The socket type does not support the requested communications protocol.
+        .TIMEDOUT => return error.ConnectionTimedOut,
+        .NOENT => return error.FileNotFound, // Returned when socket is AF.UNIX and the given path does not exist.
+        .CONNABORTED => unreachable, // Tried to reuse socket that previously received error.ConnectionRefused.
+        else => |err| return std.posix.unexpectedErrno(err),
+    }
+}
+
+pub fn accept(ctx: ?*anyopaque, exec: Reactor.Executer, socket: Runtime.Socket) *Runtime.Socket.AnyAcceptHandle {
+    _ = ctx;
+    const thread_ctx: *ThreadContext = @alignCast(@ptrCast(exec.getThreadContext()));
+
+    const sqe = thread_ctx.getSqe() catch {
+        @panic("failed to get sqe");
+    };
+
+    const op = thread_ctx.getOp() catch {
+        @panic("failed to get op");
+    };
+
+    op.* = .{
+        .waker = null,
+        .result = 0,
+        .has_result = false,
+    };
+
+    sqe.prep_accept(socket.handle, null, null, 0);
+    sqe.user_data = @intFromPtr(op);
+
+    return @ptrCast(op);
+}
+
+pub fn awaitAccept(ctx: ?*anyopaque, exec: Reactor.Executer, handle: *Runtime.Socket.AnyAcceptHandle) Runtime.Socket.AcceptError!Runtime.Socket {
+    _ = ctx;
+    const thread_ctx: *ThreadContext = @alignCast(@ptrCast(exec.getThreadContext()));
+
+    const op: *Operation = @ptrCast(@alignCast(handle));
+    defer thread_ctx.destroyOp(op);
+
+    op.waker = exec.getWaker();
+
+    while (!op.has_result) {
+        exec.@"suspend"();
+    }
+
+    switch (errno(op.result)) {
+        .SUCCESS => return .{ .handle = @bitCast(op.result) },
+        .INTR => unreachable,
+        .AGAIN => return error.WouldBlock,
+        .BADF => unreachable, // always a race condition
+        .CONNABORTED => return error.ConnectionAborted,
+        .FAULT => unreachable,
+        .INVAL => return error.SocketNotListening,
+        .NOTSOCK => unreachable,
+        .MFILE => return error.ProcessFdQuotaExceeded,
+        .NFILE => return error.SystemFdQuotaExceeded,
+        .NOBUFS => return error.SystemResources,
+        .NOMEM => return error.SystemResources,
+        .OPNOTSUPP => unreachable,
+        .PROTO => return error.ProtocolFailure,
+        .PERM => return error.BlockedByFirewall,
+        else => |err| return std.posix.unexpectedErrno(err),
+    }
+}
+
+pub fn send(ctx: ?*anyopaque, exec: Reactor.Executer, socket: Runtime.Socket, buffer: []const u8, flags: Runtime.Socket.SendFlags) *Runtime.Socket.AnySendHandle {
+    _ = ctx;
+    const thread_ctx: *ThreadContext = @alignCast(@ptrCast(exec.getThreadContext()));
+
+    const sqe = thread_ctx.getSqe() catch {
+        @panic("failed to get sqe");
+    };
+
+    const op = thread_ctx.getOp() catch {
+        @panic("failed to get op");
+    };
+
+    op.* = .{
+        .waker = null,
+        .result = 0,
+        .has_result = false,
+    };
+
+    var flags_int: u32 = 0;
+    if (flags.more) flags_int |= std.os.linux.MSG.MORE;
+    if (flags.dontwait) flags_int |= std.os.linux.MSG.DONTWAIT;
+    if (flags.nosignal) flags_int |= std.os.linux.MSG.NOSIGNAL;
+
+    sqe.prep_send(socket.handle, buffer, flags_int);
+    sqe.user_data = @intFromPtr(op);
+
+    return @ptrCast(op);
+}
+
+pub fn awaitSend(ctx: ?*anyopaque, exec: Reactor.Executer, handle: *Runtime.Socket.AnySendHandle) Runtime.Socket.SendError!usize {
+    _ = ctx;
+    const thread_ctx: *ThreadContext = @alignCast(@ptrCast(exec.getThreadContext()));
+
+    const op: *Operation = @ptrCast(@alignCast(handle));
+    defer thread_ctx.destroyOp(op);
+
+    op.waker = exec.getWaker();
+
+    while (!op.has_result) {
+        exec.@"suspend"();
+    }
+
+    switch (errno(op.result)) {
+        .SUCCESS => return @intCast(op.result),
+        .ACCES => return error.AccessDenied,
+        .AGAIN => return error.WouldBlock,
+        .ALREADY => return error.FastOpenAlreadyInProgress,
+        .BADF => unreachable, // always a race condition
+        .CONNRESET => return error.ConnectionResetByPeer,
+        .DESTADDRREQ => unreachable, // The socket is not connection-mode, and no peer address is set.
+        .FAULT => unreachable, // An invalid user space address was specified for an argument.
+        .INTR => unreachable,
+        .ISCONN => unreachable, // connection-mode socket was connected already but a recipient was specified
+        .MSGSIZE => return error.MessageTooBig,
+        .NOBUFS => return error.SystemResources,
+        .NOMEM => return error.SystemResources,
+        .NOTSOCK => unreachable, // The file descriptor sockfd does not refer to a socket.
+        .OPNOTSUPP => unreachable, // Some bit in the flags argument is inappropriate for the socket type.
+        .PIPE => return error.BrokenPipe,
+        .HOSTUNREACH => return error.NetworkUnreachable,
+        .NETUNREACH => return error.NetworkUnreachable,
+        .NETDOWN => return error.NetworkSubsystemFailed,
+        else => |err| return std.posix.unexpectedErrno(err),
+    }
+}
+
+pub fn recv(ctx: ?*anyopaque, exec: Reactor.Executer, socket: Runtime.Socket, buffer: []u8, flags: Runtime.Socket.RecvFlags) *Runtime.Socket.AnyRecvHandle {
+    _ = ctx;
+    const thread_ctx: *ThreadContext = @alignCast(@ptrCast(exec.getThreadContext()));
+
+    const sqe = thread_ctx.getSqe() catch {
+        @panic("failed to get sqe");
+    };
+    const op = thread_ctx.getOp() catch {
+        @panic("failed to get op");
+    };
+
+    op.* = .{
+        .waker = null,
+        .result = 0,
+        .has_result = false,
+    };
+
+    var flags_int: u32 = 0;
+    if (flags.peek) flags_int |= std.os.linux.MSG.PEEK;
+    if (flags.waitall) flags_int |= std.os.linux.MSG.WAITALL;
+    if (flags.dontwait) flags_int |= std.os.linux.MSG.DONTWAIT;
+
+    sqe.prep_recv(socket.handle, buffer, flags_int);
+    sqe.user_data = @intFromPtr(op);
+
+    return @ptrCast(op);
+}
+
+pub fn awaitRecv(ctx: ?*anyopaque, exec: Reactor.Executer, handle: *Runtime.Socket.AnyRecvHandle) Runtime.Socket.RecvError!usize {
+    _ = ctx;
+    const thread_ctx: *ThreadContext = @alignCast(@ptrCast(exec.getThreadContext()));
+
+    const op: *Operation = @ptrCast(@alignCast(handle));
+    defer thread_ctx.destroyOp(op);
+
+    op.waker = exec.getWaker();
+
+    while (!op.has_result) {
+        exec.@"suspend"();
+    }
+
+    switch (errno(op.result)) {
+        .SUCCESS => {
+            std.log.info("recv success: {d}", .{op.result});
+            return @intCast(op.result);
+        },
+        .BADF => unreachable, // always a race condition
+        .FAULT => unreachable,
+        .INVAL => unreachable,
+        .NOTCONN => return error.SocketNotConnected,
+        .NOTSOCK => unreachable,
+        .INTR => unreachable,
+        .AGAIN => return error.WouldBlock,
+        .NOMEM => return error.SystemResources,
+        .CONNREFUSED => return error.ConnectionRefused,
+        .CONNRESET => return error.ConnectionResetByPeer,
+        .TIMEDOUT => return error.ConnectionTimedOut,
+        else => |err| return std.posix.unexpectedErrno(err),
+    }
+}

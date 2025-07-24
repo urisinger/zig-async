@@ -4,8 +4,10 @@ const root = @import("root");
 
 const Alignment = std.mem.Alignment;
 
-const Runtime = @import("../Runtime.zig");
-const Reactor = @import("../Reactor.zig");
+const Runtime = @import("../../Runtime.zig");
+const Reactor = @import("../../Reactor.zig");
+const Context = @import("./context.zig").Context;
+const contextSwitch = @import("./context.zig").contextSwitch;
 
 const log = std.log.scoped(.Fibers);
 const assert = std.debug.assert;
@@ -56,6 +58,20 @@ const rt_vtable: Runtime.VTable = .{
     .pwrite = pwrite,
     .awaitWrite = awaitWrite,
     .sleep = sleep,
+
+    .createSocket = createSocket,
+    .awaitCreateSocket = awaitCreateSocket,
+    .closeSocket = closeSocket,
+    .bind = bind,
+    .listen = listen,
+    .connect = connect,
+    .awaitConnect = awaitConnect,
+    .accept = accept,
+    .awaitAccept = awaitAccept,
+    .send = send,
+    .awaitSend = awaitSend,
+    .recv = recv,
+    .awaitRecv = awaitRecv,
 };
 
 const exec_vtable: Reactor.Executer.VTable = .{
@@ -148,45 +164,6 @@ pub fn executer(self: *Fibers) Reactor.Executer {
         .vtable = &exec_vtable,
         .ctx = @ptrCast(self),
     };
-}
-
-const Context = switch (builtin.cpu.arch) {
-    .x86_64 => packed struct {
-        rsp: u64 = 0,
-        rbp: u64 = 0,
-        rip: u64 = 0,
-
-        fn init(entry_rip: usize, stack: usize) @This() {
-            return .{
-                .rsp = stack - 8,
-                .rbp = 0,
-                .rip = entry_rip,
-            };
-        }
-    },
-    else => |arch| @compileError("unimplemented architecture: " ++ @tagName(arch)),
-};
-
-fn contextSwitch(old_ctx: *Context, new_ctx: *const Context) void {
-    switch (builtin.cpu.arch) {
-        .x86_64 => asm volatile (
-        // Save current context
-            \\ movq %%rsp, 0(%%rax)
-            \\ movq %%rbp, 8(%%rax)
-            \\ movq $ret, 16(%%rax)
-
-            // Restore new context
-            \\ movq 0(%%rcx), %%rsp
-            \\ movq 8(%%rcx), %%rbp
-            \\ jmpq *16(%%rcx) // jump to RIP
-            \\ ret:
-            :
-            : [old] "{rax}" (old_ctx),
-              [new] "{rcx}" (new_ctx),
-            : "rax", "rbx", "rcx", "rdx", "rsi", "rdi", "rbp", "rsp", "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15", "fpsr", "fpcr", "mxcsr", "rflags", "dirflag", "memory"
-        ),
-        else => |arch| @compileError("unimplemented architecture: " ++ @tagName(arch)),
-    }
 }
 
 fn reschedule(rt: *Fibers, task: *Task.Detached) void {
@@ -300,7 +277,7 @@ const Task = union(enum) {
             task.* = .{
                 .fiber = .{
                     .stack = aligned_stack, // Store properly aligned slice
-                    .ctx = .init(@intFromPtr(&Fiber.trampoline), stack_top),
+                    .ctx = .init(@intFromPtr(&Task.trampoline), stack_top),
                 },
                 .start = start,
                 .context_buf = context_buf,
@@ -374,7 +351,7 @@ const Task = union(enum) {
             node.* = .{
                 .task = .{
                     .fiber = .{
-                        .ctx = .init(@intFromPtr(&Fiber.trampoline), stack_top),
+                        .ctx = .init(@intFromPtr(&Task.trampoline), stack_top),
                         .stack = @alignCast(stack_mem[0..stack_size]),
                     },
                     .start = start,
@@ -425,12 +402,6 @@ const Task = union(enum) {
         };
         contextSwitch(&old_fiber.ctx, new_ctx);
     }
-};
-
-/// A single fiber, with its own stack and saved context.
-const Fiber = struct {
-    ctx: Context,
-    stack: []align(4096) u8,
 
     fn trampoline() callconv(.C) noreturn {
         const task = Task.current();
@@ -444,9 +415,14 @@ const Fiber = struct {
         }
 
         task.yeild();
-
         unreachable;
     }
+};
+
+/// A single fiber, with its own stack and saved context.
+const Fiber = struct {
+    ctx: Context,
+    stack: []align(4096) u8,
 };
 
 // For now a thread is basiclly a detached fiber, later on we can make it steal work from other threads
@@ -790,4 +766,69 @@ fn awaitWrite(ctx: ?*anyopaque, handle: *Runtime.File.AnyWriteHandle) Runtime.Fi
 fn sleep(ctx: ?*anyopaque, ms: u64) void {
     const rt: *Fibers = @alignCast(@ptrCast(ctx));
     rt.reactor.vtable.sleep(rt.reactor.ctx, rt.executer(), ms);
+}
+
+fn createSocket(ctx: ?*anyopaque, domain: Runtime.Socket.Domain, protocol: Runtime.Socket.Protocol) *Runtime.Socket.AnyCreateHandle {
+    const rt: *Fibers = @alignCast(@ptrCast(ctx));
+    return rt.reactor.vtable.createSocket(rt.reactor.ctx, rt.executer(), domain, protocol);
+}
+
+fn awaitCreateSocket(ctx: ?*anyopaque, handle: *Runtime.Socket.AnyCreateHandle) Runtime.Socket.CreateError!Runtime.Socket {
+    const rt: *Fibers = @alignCast(@ptrCast(ctx));
+    return rt.reactor.vtable.awaitCreateSocket(rt.reactor.ctx, rt.executer(), handle);
+}
+
+fn closeSocket(ctx: ?*anyopaque, socket: Runtime.Socket) void {
+    const rt: *Fibers = @alignCast(@ptrCast(ctx));
+    rt.reactor.vtable.closeSocket(rt.reactor.ctx, rt.executer(), socket);
+}
+
+fn bind(ctx: ?*anyopaque, socket: Runtime.Socket, address: *const Runtime.Socket.Address, length: u32) Runtime.Socket.BindError!void {
+    const rt: *Fibers = @alignCast(@ptrCast(ctx));
+    try rt.reactor.vtable.bind(rt.reactor.ctx, rt.executer(), socket, address, length);
+}
+
+fn listen(ctx: ?*anyopaque, socket: Runtime.Socket, backlog: u32) Runtime.Socket.ListenError!void {
+    const rt: *Fibers = @alignCast(@ptrCast(ctx));
+    try rt.reactor.vtable.listen(rt.reactor.ctx, rt.executer(), socket, backlog);
+}
+
+fn connect(ctx: ?*anyopaque, socket: Runtime.Socket, address: *const Runtime.Socket.Address) *Runtime.Socket.AnyConnectHandle {
+    const rt: *Fibers = @alignCast(@ptrCast(ctx));
+    return rt.reactor.vtable.connect(rt.reactor.ctx, rt.executer(), socket, address);
+}
+
+fn awaitConnect(ctx: ?*anyopaque, handle: *Runtime.Socket.AnyConnectHandle) Runtime.Socket.ConnectError!void {
+    const rt: *Fibers = @alignCast(@ptrCast(ctx));
+    return rt.reactor.vtable.awaitConnect(rt.reactor.ctx, rt.executer(), handle);
+}
+
+fn accept(ctx: ?*anyopaque, socket: Runtime.Socket) *Runtime.Socket.AnyAcceptHandle {
+    const rt: *Fibers = @alignCast(@ptrCast(ctx));
+    return rt.reactor.vtable.accept(rt.reactor.ctx, rt.executer(), socket);
+}
+
+fn awaitAccept(ctx: ?*anyopaque, handle: *Runtime.Socket.AnyAcceptHandle) Runtime.Socket.AcceptError!Runtime.Socket {
+    const rt: *Fibers = @alignCast(@ptrCast(ctx));
+    return rt.reactor.vtable.awaitAccept(rt.reactor.ctx, rt.executer(), handle);
+}
+
+fn send(ctx: ?*anyopaque, socket: Runtime.Socket, buffer: []const u8, flags: Runtime.Socket.SendFlags) *Runtime.Socket.AnySendHandle {
+    const rt: *Fibers = @alignCast(@ptrCast(ctx));
+    return rt.reactor.vtable.send(rt.reactor.ctx, rt.executer(), socket, buffer, flags);
+}
+
+fn awaitSend(ctx: ?*anyopaque, handle: *Runtime.Socket.AnySendHandle) Runtime.Socket.SendError!usize {
+    const rt: *Fibers = @alignCast(@ptrCast(ctx));
+    return rt.reactor.vtable.awaitSend(rt.reactor.ctx, rt.executer(), handle);
+}
+
+fn recv(ctx: ?*anyopaque, socket: Runtime.Socket, buffer: []u8, flags: Runtime.Socket.RecvFlags) *Runtime.Socket.AnyRecvHandle {
+    const rt: *Fibers = @alignCast(@ptrCast(ctx));
+    return rt.reactor.vtable.recv(rt.reactor.ctx, rt.executer(), socket, buffer, flags);
+}
+
+fn awaitRecv(ctx: ?*anyopaque, handle: *Runtime.Socket.AnyRecvHandle) Runtime.Socket.RecvError!usize {
+    const rt: *Fibers = @alignCast(@ptrCast(ctx));
+    return rt.reactor.vtable.awaitRecv(rt.reactor.ctx, rt.executer(), handle);
 }

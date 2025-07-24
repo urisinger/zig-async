@@ -44,7 +44,133 @@ pub const VTable = struct {
     awaitRead: *const fn (ctx: ?*anyopaque, handle: *File.AnyReadHandle) File.PReadError!usize,
     pwrite: *const fn (ctx: ?*anyopaque, file: File, buffer: []const u8, offset: std.posix.off_t) *File.AnyWriteHandle,
     awaitWrite: *const fn (ctx: ?*anyopaque, handle: *File.AnyWriteHandle) File.PWriteError!usize,
+
+    createSocket: *const fn (ctx: ?*anyopaque, domain: Socket.Domain, protocol: Socket.Protocol) *Socket.AnyCreateHandle,
+    awaitCreateSocket: *const fn (ctx: ?*anyopaque, handle: *Socket.AnyCreateHandle) Socket.CreateError!Socket,
+    closeSocket: *const fn (ctx: ?*anyopaque, socket: Socket) void,
+
+    bind: *const fn (ctx: ?*anyopaque, socket: Socket, address: *const Socket.Address, length: u32) Socket.BindError!void,
+    listen: *const fn (ctx: ?*anyopaque, socket: Socket, backlog: u32) Socket.ListenError!void,
+
+    connect: *const fn (ctx: ?*anyopaque, socket: Socket, address: *const Socket.Address) *Socket.AnyConnectHandle,
+    awaitConnect: *const fn (ctx: ?*anyopaque, handle: *Socket.AnyConnectHandle) Socket.ConnectError!void,
+
+    accept: *const fn (ctx: ?*anyopaque, socket: Socket) *Socket.AnyAcceptHandle,
+    awaitAccept: *const fn (ctx: ?*anyopaque, handle: *Socket.AnyAcceptHandle) Socket.AcceptError!Socket,
+
+    send: *const fn (ctx: ?*anyopaque, socket: Socket, buffer: []const u8, flags: Socket.SendFlags) *Socket.AnySendHandle,
+    awaitSend: *const fn (ctx: ?*anyopaque, handle: *Socket.AnySendHandle) Socket.SendError!usize,
+    recv: *const fn (ctx: ?*anyopaque, socket: Socket, buffer: []u8, flags: Socket.RecvFlags) *Socket.AnyRecvHandle,
+    awaitRecv: *const fn (ctx: ?*anyopaque, handle: *Socket.AnyRecvHandle) Socket.RecvError!usize,
+
     sleep: *const fn (ctx: ?*anyopaque, ms: u64) void,
+};
+
+pub const Socket = struct {
+    handle: Handle,
+
+    pub const Handle = std.posix.socket_t;
+
+    pub const AcceptError = std.posix.AcceptError;
+
+    pub const Domain = enum {
+        ipv4,
+        ipv6,
+        unix,
+    };
+
+    pub const Protocol = enum {
+        tcp,
+        udp,
+        default,
+    };
+
+    pub const CreateError = std.posix.SocketError;
+    pub const BindError = std.posix.BindError;
+    pub const ConnectError = std.posix.ConnectError;
+    pub const SendError = std.posix.SendError;
+    pub const RecvError = std.posix.RecvFromError;
+    pub const ListenError = std.posix.ListenError;
+
+    pub const SendFlags = struct {
+        dontwait: bool = false,
+        more: bool = false,
+        nosignal: bool = false,
+    };
+
+    pub const RecvFlags = struct {
+        dontwait: bool = false,
+        peek: bool = false,
+        waitall: bool = false,
+    };
+
+    pub fn close(socket: Socket, runtime: Runtime) void {
+        return runtime.vtable.closeSocket(runtime.ctx, socket);
+    }
+
+    pub fn bind(socket: Socket, runtime: Runtime, address: *const Socket.Address, length: u32) BindError!void {
+        return runtime.vtable.bind(runtime.ctx, socket, address, length);
+    }
+
+    pub fn listen(socket: Socket, runtime: Runtime, backlog: u32) ListenError!void {
+        return runtime.vtable.listen(runtime.ctx, socket, backlog);
+    }
+
+    pub fn accept(socket: Socket, runtime: Runtime) *AnyAcceptHandle {
+        return runtime.vtable.accept(runtime.ctx, socket);
+    }
+
+    pub fn send(socket: Socket, runtime: Runtime, buffer: []const u8, flags: SendFlags) *AnySendHandle {
+        return runtime.vtable.send(runtime.ctx, socket, buffer, flags);
+    }
+
+    pub fn recv(socket: Socket, runtime: Runtime, buffer: []u8, flags: RecvFlags) *AnyRecvHandle {
+        return runtime.vtable.recv(runtime.ctx, socket, buffer, flags);
+    }
+
+    pub const AnyCreateHandle = opaque {
+        pub fn @"await"(self: *AnyCreateHandle, runtime: Runtime) CreateError!Socket {
+            return runtime.vtable.awaitCreateSocket(runtime.ctx, self);
+        }
+    };
+
+    pub const AnyBindHandle = opaque {
+        pub fn @"await"(self: *AnyBindHandle, runtime: Runtime) BindError!void {
+            return runtime.vtable.awaitBind(runtime.ctx, self);
+        }
+    };
+
+    pub const AnyAcceptHandle = opaque {
+        pub fn @"await"(self: *AnyAcceptHandle, runtime: Runtime) AcceptError!Socket {
+            return runtime.vtable.awaitAccept(runtime.ctx, self);
+        }
+    };
+
+    pub const AnyConnectHandle = opaque {
+        pub fn @"await"(self: *AnyConnectHandle, runtime: Runtime) ConnectError!void {
+            return runtime.vtable.awaitConnect(runtime.ctx, self);
+        }
+    };
+
+    pub const AnySendHandle = opaque {
+        pub fn @"await"(self: *AnySendHandle, runtime: Runtime) SendError!usize {
+            return runtime.vtable.awaitSend(runtime.ctx, self);
+        }
+    };
+
+    pub const AnyRecvHandle = opaque {
+        pub fn @"await"(self: *AnyRecvHandle, runtime: Runtime) RecvError!usize {
+            return runtime.vtable.awaitRecv(runtime.ctx, self);
+        }
+    };
+
+    pub const ReadError = std.net.Stream.ReadError;
+    pub const AnyReadHandle = opaque {
+        pub fn @"await"(self: *AnyReadHandle, runtime: Runtime) ReadError!usize {
+            return runtime.vtable.awaitRead(runtime.ctx, self);
+        }
+    };
+    pub const Address = std.posix.sockaddr;
 };
 
 pub const AnySpawnHandle = opaque {};
@@ -259,10 +385,18 @@ pub inline fn select(runtime: Runtime, s: anytype) SelectUnion(@TypeOf(s)) {
     }
 }
 
+pub inline fn selectAny(runtime: Runtime, futures: []const AnyFuture) usize {
+    return runtime.vtable.select(runtime.ctx, futures);
+}
+
 pub fn open(runtime: Runtime, path: []const u8, flags: File.OpenFlags) !File {
     return runtime.vtable.openFile(runtime.ctx, path, flags);
 }
 
 pub fn sleep(runtime: Runtime, ms: u64) void {
     runtime.vtable.sleep(runtime.ctx, ms);
+}
+
+pub fn createSocket(runtime: Runtime, domain: Socket.Domain, protocol: Socket.Protocol) Socket.CreateError!Socket {
+    return runtime.vtable.createSocket(runtime.ctx, domain, protocol).@"await"(runtime);
 }
