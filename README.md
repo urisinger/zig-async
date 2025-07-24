@@ -17,3 +17,5 @@ The interface provides four primary methods for executing tasks asynchronously: 
 Currently, most functions for working with TCP sockets are implemented, along with file reading and writing functions.
 
 All asynchronous I/O functions return a **Pooler**, which can be used to poll for results or awaited.
+
+At the moment, this runtime only works on linux, contributions from anyone who knows a bit about windows are welcome.
