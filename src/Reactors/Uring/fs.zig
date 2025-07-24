@@ -38,7 +38,7 @@ pub fn getStdIn(ctx: ?*anyopaque, exec: Reactor.Executer) Runtime.File {
 }
 
 // Async file read
-pub fn pread(ctx: ?*anyopaque, exec: Reactor.Executer, file: Runtime.File, buffer: []u8, offset: std.posix.off_t) *Runtime.File.AnyReadHandle {
+pub fn pread(ctx: ?*anyopaque, exec: Reactor.Executer, file: Runtime.File, buffer: []u8, offset: std.posix.off_t) Runtime.Poller(Runtime.File.PReadError!usize) {
     _ = ctx;
     const thread_ctx: *ThreadContext = @alignCast(@ptrCast(exec.getThreadContext()));
 
@@ -53,42 +53,47 @@ pub fn pread(ctx: ?*anyopaque, exec: Reactor.Executer, file: Runtime.File, buffe
         .waker = null,
         .result = 0,
         .has_result = false,
+        .exec = exec,
     };
 
     sqe.prep_read(file.handle, buffer, @bitCast(offset));
     sqe.user_data = @intFromPtr(op);
 
-    return @ptrCast(op);
+    return .{
+        .poll = @ptrCast(&pollRead),
+        .poller_ctx = @ptrCast(op),
+        .result = undefined,
+    };
 }
 
-pub fn awaitRead(ctx: ?*anyopaque, exec: Reactor.Executer, handle: *Runtime.File.AnyReadHandle) Runtime.File.ReadError!usize {
-    _ = ctx;
-    const thread_ctx: *ThreadContext = @alignCast(@ptrCast(exec.getThreadContext()));
-    const sqe_op: *Operation = @alignCast(@ptrCast(handle));
-    defer thread_ctx.destroyOp(sqe_op);
-    sqe_op.waker = exec.getWaker();
+pub fn pollRead(poller_ctx: ?*anyopaque) ?Runtime.File.ReadError!usize {
+    const sqe_op: *Operation = @alignCast(@ptrCast(poller_ctx));
 
-    while (!sqe_op.has_result) {
-        if (exec.@"suspend"()) {
+    if (!sqe_op.has_result) {
+        const exec = sqe_op.exec.?;
+        sqe_op.waker = exec.getWaker();
+        if (exec.isCanceled()) {
             return error.Canceled;
         }
+        return null;
     }
 
-    switch (errno(sqe_op.result)) {
-        .SUCCESS => return @as(u32, @bitCast(sqe_op.result)),
+    const result = sqe_op.result;
+    return switch (errno(result)) {
+        .SUCCESS => @as(usize, @intCast(result)),
         .INTR => unreachable,
-        .CANCELED => return error.Canceled,
+        .CANCELED => error.Canceled,
 
         .INVAL => unreachable,
         .FAULT => unreachable,
-        .NOENT => return error.ProcessNotFound,
-        .AGAIN => return error.WouldBlock,
-        else => |err| return std.posix.unexpectedErrno(err),
-    }
+        .NOENT => error.ProcessNotFound,
+        .AGAIN => error.WouldBlock,
+        else => |err| std.posix.unexpectedErrno(err),
+    };
 }
 
 // Async file write
-pub fn pwrite(ctx: ?*anyopaque, exec: Reactor.Executer, file: Runtime.File, buffer: []const u8, offset: std.posix.off_t) *Runtime.File.AnyWriteHandle {
+pub fn pwrite(ctx: ?*anyopaque, exec: Reactor.Executer, file: Runtime.File, buffer: []const u8, offset: std.posix.off_t) Runtime.Poller(Runtime.File.PWriteError!usize) {
     _ = ctx;
     const thread_ctx: *ThreadContext = @alignCast(@ptrCast(exec.getThreadContext()));
 
@@ -104,47 +109,52 @@ pub fn pwrite(ctx: ?*anyopaque, exec: Reactor.Executer, file: Runtime.File, buff
         .waker = null,
         .result = 0,
         .has_result = false,
+        .exec = exec,
     };
 
     sqe.prep_write(file.handle, buffer, @bitCast(offset));
     sqe.user_data = @intFromPtr(op);
 
-    return @ptrCast(op);
+    return .{
+        .poll = @ptrCast(&pollWrite),
+        .poller_ctx = @ptrCast(op),
+        .result = undefined,
+    };
 }
 
-pub fn awaitWrite(ctx: ?*anyopaque, exec: Reactor.Executer, handle: *Runtime.File.AnyWriteHandle) Runtime.File.PWriteError!usize {
-    _ = ctx;
-    const thread_ctx: *ThreadContext = @alignCast(@ptrCast(exec.getThreadContext()));
-    const sqe_op: *Operation = @alignCast(@ptrCast(handle));
-    defer thread_ctx.destroyOp(sqe_op);
-    sqe_op.waker = exec.getWaker();
+pub fn pollWrite(poller_ctx: ?*anyopaque) ?Runtime.File.PWriteError!usize {
+    const sqe_op: *Operation = @alignCast(@ptrCast(poller_ctx));
 
     // Suspend until the operation completes
-    while (!sqe_op.has_result) {
-        if (exec.@"suspend"()) {
+    if (!sqe_op.has_result) {
+        const exec = sqe_op.exec.?;
+        sqe_op.waker = exec.getWaker();
+        if (exec.isCanceled()) {
             return error.Canceled;
         }
+        return null;
     }
 
-    switch (errno(sqe_op.result)) {
-        .SUCCESS => return @as(u32, @bitCast(sqe_op.result)),
+    const result = sqe_op.result;
+    return switch (errno(result)) {
+        .SUCCESS => @as(u32, @bitCast(result)),
         .INTR => unreachable,
         .INVAL => unreachable,
         .FAULT => unreachable,
         .AGAIN => unreachable,
-        .BADF => return error.NotOpenForWriting, // can be a race condition.
+        .BADF => error.NotOpenForWriting, // can be a race condition.
         .DESTADDRREQ => unreachable, // `connect` was never called.
-        .DQUOT => return error.DiskQuota,
-        .FBIG => return error.FileTooBig,
-        .IO => return error.InputOutput,
-        .NOSPC => return error.NoSpaceLeft,
-        .PERM => return error.AccessDenied,
-        .PIPE => return error.BrokenPipe,
-        .NXIO => return error.Unseekable,
-        .SPIPE => return error.Unseekable,
-        .OVERFLOW => return error.Unseekable,
-        else => |err| return std.posix.unexpectedErrno(err),
-    }
+        .DQUOT => error.DiskQuota,
+        .FBIG => error.FileTooBig,
+        .IO => error.InputOutput,
+        .NOSPC => error.NoSpaceLeft,
+        .PERM => error.AccessDenied,
+        .PIPE => error.BrokenPipe,
+        .NXIO => error.Unseekable,
+        .SPIPE => error.Unseekable,
+        .OVERFLOW => error.Unseekable,
+        else => |err| std.posix.unexpectedErrno(err),
+    };
 }
 
 // Close file

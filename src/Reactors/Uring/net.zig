@@ -9,7 +9,7 @@ const Operation = Uring.Operation;
 const CreateError = Runtime.Socket.CreateError;
 const errno = Uring.errno;
 
-pub fn createSocket(ctx: ?*anyopaque, exec: Reactor.Executer, domain: Runtime.Socket.Domain, protocol: Runtime.Socket.Protocol) *Runtime.Socket.AnyCreateHandle {
+pub fn createSocket(ctx: ?*anyopaque, exec: Reactor.Executer, domain: Runtime.Socket.Domain, protocol: Runtime.Socket.Protocol) Runtime.Poller(Runtime.Socket.CreateError!Runtime.Socket) {
     _ = ctx;
     const thread_ctx: *ThreadContext = @alignCast(@ptrCast(exec.getThreadContext()));
 
@@ -24,6 +24,7 @@ pub fn createSocket(ctx: ?*anyopaque, exec: Reactor.Executer, domain: Runtime.So
         .waker = null,
         .result = 0,
         .has_result = false,
+        .exec = exec,
     };
 
     const domain_int: u32 = switch (domain) {
@@ -46,26 +47,30 @@ pub fn createSocket(ctx: ?*anyopaque, exec: Reactor.Executer, domain: Runtime.So
     sqe.prep_socket(domain_int, type_int, protocol_int, 0);
     sqe.user_data = @intFromPtr(op);
 
-    return @ptrCast(op);
+    return .{
+        .poll = @ptrCast(&pollCreateSocket),
+        .poller_ctx = @ptrCast(op),
+        .result = undefined,
+    };
 }
 
-pub fn awaitCreateSocket(ctx: ?*anyopaque, exec: Reactor.Executer, handle: *Runtime.Socket.AnyCreateHandle) Runtime.Socket.CreateError!Runtime.Socket {
-    _ = ctx;
-    const thread_ctx: *ThreadContext = @alignCast(@ptrCast(exec.getThreadContext()));
+pub fn pollCreateSocket(poller_ctx: ?*anyopaque) ?Runtime.Socket.CreateError!Runtime.Socket {
+    const op: *Operation = @ptrCast(@alignCast(poller_ctx));
 
-    const op: *Operation = @ptrCast(@alignCast(handle));
-    defer thread_ctx.destroyOp(op);
-    op.waker = exec.getWaker();
+    if (!op.has_result) {
+        const exec = op.exec.?;
 
-    while (!op.has_result) {
-        if (exec.@"suspend"()) {
+        op.waker = exec.getWaker();
+        if (exec.isCanceled()) {
             return error.Canceled;
         }
+        return null;
     }
 
-    const socket: Runtime.Socket = .{
-        .handle = switch (errno(op.result)) {
-            .SUCCESS => @bitCast(op.result),
+    const result = op.result;
+    return .{
+        .handle = switch (errno(result)) {
+            .SUCCESS => @bitCast(result),
             .ACCES => return error.PermissionDenied,
             .AFNOSUPPORT => return error.AddressFamilyNotSupported,
             .INVAL => return error.ProtocolFamilyNotAvailable,
@@ -78,8 +83,6 @@ pub fn awaitCreateSocket(ctx: ?*anyopaque, exec: Reactor.Executer, handle: *Runt
             else => |err| return std.posix.unexpectedErrno(err),
         },
     };
-
-    return socket;
 }
 
 pub fn closeSocket(ctx: ?*anyopaque, exec: Reactor.Executer, socket: Runtime.Socket) void {
@@ -100,7 +103,7 @@ pub fn listen(ctx: ?*anyopaque, exec: Reactor.Executer, socket: Runtime.Socket, 
     try std.posix.listen(socket.handle, @truncate(backlog));
 }
 
-pub fn connect(ctx: ?*anyopaque, exec: Reactor.Executer, socket: Runtime.Socket, address: *const Runtime.Socket.Address) *Runtime.Socket.AnyConnectHandle {
+pub fn connect(ctx: ?*anyopaque, exec: Reactor.Executer, socket: Runtime.Socket, address: *const Runtime.Socket.Address) Runtime.Poller(Runtime.Socket.ConnectError!void) {
     _ = ctx;
     const thread_ctx: *ThreadContext = @alignCast(@ptrCast(exec.getThreadContext()));
 
@@ -115,30 +118,36 @@ pub fn connect(ctx: ?*anyopaque, exec: Reactor.Executer, socket: Runtime.Socket,
         .waker = null,
         .result = 0,
         .has_result = false,
+        .exec = exec,
     };
 
     sqe.prep_connect(socket.handle, address, @sizeOf(Runtime.Socket.Address));
     sqe.user_data = @intFromPtr(op);
 
-    return @ptrCast(op);
+    return .{
+        .poll = @ptrCast(&pollConnect),
+        .poller_ctx = @ptrCast(op),
+        .result = undefined,
+    };
 }
 
-pub fn awaitConnect(ctx: ?*anyopaque, exec: Reactor.Executer, handle: *Runtime.Socket.AnyConnectHandle) Runtime.Socket.ConnectError!void {
-    _ = ctx;
-    const thread_ctx: *ThreadContext = @alignCast(@ptrCast(exec.getThreadContext()));
+pub fn pollConnect(poller_ctx: ?*anyopaque) ?Runtime.Socket.ConnectError!void {
+    const op: *Operation = @ptrCast(@alignCast(poller_ctx));
 
-    const op: *Operation = @ptrCast(@alignCast(handle));
-    defer thread_ctx.destroyOp(op);
+    if (!op.has_result) {
+        const exec = op.exec.?;
 
-    op.waker = exec.getWaker();
-
-    while (!op.has_result) {
-        if (exec.@"suspend"()) {
+        op.waker = exec.getWaker();
+        if (exec.isCanceled()) {
             return error.Canceled;
         }
+        return null;
     }
-    switch (errno(op.result)) {
-        .SUCCESS => return,
+
+    const result = op.result;
+
+    return switch (errno(result)) {
+        .SUCCESS => {},
         .ACCES => return error.PermissionDenied,
         .PERM => return error.PermissionDenied,
         .ADDRINUSE => return error.AddressInUse,
@@ -160,10 +169,10 @@ pub fn awaitConnect(ctx: ?*anyopaque, exec: Reactor.Executer, handle: *Runtime.S
         .NOENT => return error.FileNotFound, // Returned when socket is AF.UNIX and the given path does not exist.
         .CONNABORTED => unreachable, // Tried to reuse socket that previously received error.ConnectionRefused.
         else => |err| return std.posix.unexpectedErrno(err),
-    }
+    };
 }
 
-pub fn accept(ctx: ?*anyopaque, exec: Reactor.Executer, socket: Runtime.Socket) *Runtime.Socket.AnyAcceptHandle {
+pub fn accept(ctx: ?*anyopaque, exec: Reactor.Executer, socket: Runtime.Socket) Runtime.Poller(Runtime.Socket.AcceptError!Runtime.Socket) {
     _ = ctx;
     const thread_ctx: *ThreadContext = @alignCast(@ptrCast(exec.getThreadContext()));
 
@@ -179,50 +188,55 @@ pub fn accept(ctx: ?*anyopaque, exec: Reactor.Executer, socket: Runtime.Socket) 
         .waker = null,
         .result = 0,
         .has_result = false,
+        .exec = exec,
     };
 
     sqe.prep_accept(socket.handle, null, null, 0);
     sqe.user_data = @intFromPtr(op);
 
-    return @ptrCast(op);
+    return .{
+        .poll = @ptrCast(&pollAccept),
+        .poller_ctx = @ptrCast(op),
+        .result = undefined,
+    };
 }
 
-pub fn awaitAccept(ctx: ?*anyopaque, exec: Reactor.Executer, handle: *Runtime.Socket.AnyAcceptHandle) Runtime.Socket.AcceptError!Runtime.Socket {
-    _ = ctx;
-    const thread_ctx: *ThreadContext = @alignCast(@ptrCast(exec.getThreadContext()));
+pub fn pollAccept(poller_ctx: ?*anyopaque) ?Runtime.Socket.AcceptError!Runtime.Socket {
+    const op: *Operation = @ptrCast(@alignCast(poller_ctx));
 
-    const op: *Operation = @ptrCast(@alignCast(handle));
-    defer thread_ctx.destroyOp(op);
+    if (!op.has_result) {
+        const exec = op.exec.?;
 
-    op.waker = exec.getWaker();
-
-    while (!op.has_result) {
-        if (exec.@"suspend"()) {
+        op.waker = exec.getWaker();
+        if (exec.isCanceled()) {
             return error.Canceled;
         }
+        return null;
     }
 
-    switch (errno(op.result)) {
-        .SUCCESS => return .{ .handle = @bitCast(op.result) },
+    const result = op.result;
+
+    return switch (errno(result)) {
+        .SUCCESS => .{ .handle = @bitCast(result) },
         .INTR => unreachable,
         .AGAIN => return error.WouldBlock,
         .BADF => unreachable, // always a race condition
-        .CONNABORTED => return error.ConnectionAborted,
+        .CONNABORTED => error.ConnectionAborted,
         .FAULT => unreachable,
-        .INVAL => return error.SocketNotListening,
+        .INVAL => error.SocketNotListening,
         .NOTSOCK => unreachable,
-        .MFILE => return error.ProcessFdQuotaExceeded,
-        .NFILE => return error.SystemFdQuotaExceeded,
-        .NOBUFS => return error.SystemResources,
-        .NOMEM => return error.SystemResources,
+        .MFILE => error.ProcessFdQuotaExceeded,
+        .NFILE => error.SystemFdQuotaExceeded,
+        .NOBUFS => error.SystemResources,
+        .NOMEM => error.SystemResources,
         .OPNOTSUPP => unreachable,
-        .PROTO => return error.ProtocolFailure,
-        .PERM => return error.BlockedByFirewall,
-        else => |err| return std.posix.unexpectedErrno(err),
-    }
+        .PROTO => error.ProtocolFailure,
+        .PERM => error.BlockedByFirewall,
+        else => |err| std.posix.unexpectedErrno(err),
+    };
 }
 
-pub fn send(ctx: ?*anyopaque, exec: Reactor.Executer, socket: Runtime.Socket, buffer: []const u8, flags: Runtime.Socket.SendFlags) *Runtime.Socket.AnySendHandle {
+pub fn send(ctx: ?*anyopaque, exec: Reactor.Executer, socket: Runtime.Socket, buffer: []const u8, flags: Runtime.Socket.SendFlags) Runtime.Poller(Runtime.Socket.SendError!usize) {
     _ = ctx;
     const thread_ctx: *ThreadContext = @alignCast(@ptrCast(exec.getThreadContext()));
 
@@ -238,6 +252,7 @@ pub fn send(ctx: ?*anyopaque, exec: Reactor.Executer, socket: Runtime.Socket, bu
         .waker = null,
         .result = 0,
         .has_result = false,
+        .exec = exec,
     };
 
     var flags_int: u32 = 0;
@@ -248,49 +263,52 @@ pub fn send(ctx: ?*anyopaque, exec: Reactor.Executer, socket: Runtime.Socket, bu
     sqe.prep_send(socket.handle, buffer, flags_int);
     sqe.user_data = @intFromPtr(op);
 
-    return @ptrCast(op);
+    return .{
+        .poll = @ptrCast(&pollSend),
+        .poller_ctx = @ptrCast(op),
+        .result = undefined,
+    };
 }
 
-pub fn awaitSend(ctx: ?*anyopaque, exec: Reactor.Executer, handle: *Runtime.Socket.AnySendHandle) Runtime.Socket.SendError!usize {
-    _ = ctx;
-    const thread_ctx: *ThreadContext = @alignCast(@ptrCast(exec.getThreadContext()));
+pub fn pollSend(poller_ctx: ?*anyopaque) ?Runtime.Socket.SendError!usize {
+    const op: *Operation = @ptrCast(@alignCast(poller_ctx));
 
-    const op: *Operation = @ptrCast(@alignCast(handle));
-    defer thread_ctx.destroyOp(op);
+    if (!op.has_result) {
+        const exec = op.exec.?;
 
-    op.waker = exec.getWaker();
-
-    while (!op.has_result) {
-        if (exec.@"suspend"()) {
+        op.waker = exec.getWaker();
+        if (exec.isCanceled()) {
             return error.Canceled;
         }
+        return null;
     }
 
-    switch (errno(op.result)) {
-        .SUCCESS => return @intCast(op.result),
+    const result = op.result;
+    return switch (errno(result)) {
+        .SUCCESS => @as(usize, @intCast(result)),
         .ACCES => return error.AccessDenied,
         .AGAIN => return error.WouldBlock,
         .ALREADY => return error.FastOpenAlreadyInProgress,
         .BADF => unreachable, // always a race condition
-        .CONNRESET => return error.ConnectionResetByPeer,
+        .CONNRESET => error.ConnectionResetByPeer,
         .DESTADDRREQ => unreachable, // The socket is not connection-mode, and no peer address is set.
         .FAULT => unreachable, // An invalid user space address was specified for an argument.
         .INTR => unreachable,
         .ISCONN => unreachable, // connection-mode socket was connected already but a recipient was specified
-        .MSGSIZE => return error.MessageTooBig,
-        .NOBUFS => return error.SystemResources,
-        .NOMEM => return error.SystemResources,
+        .MSGSIZE => error.MessageTooBig,
+        .NOBUFS => error.SystemResources,
+        .NOMEM => error.SystemResources,
         .NOTSOCK => unreachable, // The file descriptor sockfd does not refer to a socket.
         .OPNOTSUPP => unreachable, // Some bit in the flags argument is inappropriate for the socket type.
-        .PIPE => return error.BrokenPipe,
-        .HOSTUNREACH => return error.NetworkUnreachable,
-        .NETUNREACH => return error.NetworkUnreachable,
-        .NETDOWN => return error.NetworkSubsystemFailed,
-        else => |err| return std.posix.unexpectedErrno(err),
-    }
+        .PIPE => error.BrokenPipe,
+        .HOSTUNREACH => error.NetworkUnreachable,
+        .NETUNREACH => error.NetworkUnreachable,
+        .NETDOWN => error.NetworkSubsystemFailed,
+        else => |err| std.posix.unexpectedErrno(err),
+    };
 }
 
-pub fn recv(ctx: ?*anyopaque, exec: Reactor.Executer, socket: Runtime.Socket, buffer: []u8, flags: Runtime.Socket.RecvFlags) *Runtime.Socket.AnyRecvHandle {
+pub fn recv(ctx: ?*anyopaque, exec: Reactor.Executer, socket: Runtime.Socket, buffer: []u8, flags: Runtime.Socket.RecvFlags) Runtime.Poller(Runtime.Socket.RecvError!usize) {
     _ = ctx;
     const thread_ctx: *ThreadContext = @alignCast(@ptrCast(exec.getThreadContext()));
 
@@ -303,6 +321,7 @@ pub fn recv(ctx: ?*anyopaque, exec: Reactor.Executer, socket: Runtime.Socket, bu
 
     op.* = .{
         .waker = null,
+        .exec = exec,
         .result = 0,
         .has_result = false,
     };
@@ -315,29 +334,30 @@ pub fn recv(ctx: ?*anyopaque, exec: Reactor.Executer, socket: Runtime.Socket, bu
     sqe.prep_recv(socket.handle, buffer, flags_int);
     sqe.user_data = @intFromPtr(op);
 
-    return @ptrCast(op);
+    return .{
+        .poll = @ptrCast(&pollRecv),
+        .poller_ctx = @ptrCast(op),
+        .result = undefined,
+    };
 }
 
-pub fn awaitRecv(ctx: ?*anyopaque, exec: Reactor.Executer, handle: *Runtime.Socket.AnyRecvHandle) Runtime.Socket.RecvError!usize {
-    _ = ctx;
-    const thread_ctx: *ThreadContext = @alignCast(@ptrCast(exec.getThreadContext()));
+pub fn pollRecv(poller_ctx: ?*anyopaque) ?Runtime.Socket.RecvError!usize {
+    const op: *Operation = @ptrCast(@alignCast(poller_ctx));
 
-    const op: *Operation = @ptrCast(@alignCast(handle));
-    defer thread_ctx.destroyOp(op);
+    if (!op.has_result) {
+        const exec = op.exec.?;
 
-    op.waker = exec.getWaker();
-
-    while (!op.has_result) {
-        if (exec.@"suspend"()) {
+        op.waker = exec.getWaker();
+        if (exec.isCanceled()) {
             return error.Canceled;
         }
+        return null;
     }
 
-    switch (errno(op.result)) {
-        .SUCCESS => {
-            std.log.info("recv success: {d}", .{op.result});
-            return @intCast(op.result);
-        },
+    const result = op.result;
+
+    return switch (errno(result)) {
+        .SUCCESS => return @as(usize, @intCast(result)),
         .BADF => unreachable, // always a race condition
         .FAULT => unreachable,
         .INVAL => unreachable,
@@ -349,6 +369,6 @@ pub fn awaitRecv(ctx: ?*anyopaque, exec: Reactor.Executer, handle: *Runtime.Sock
         .CONNREFUSED => return error.ConnectionRefused,
         .CONNRESET => return error.ConnectionResetByPeer,
         .TIMEDOUT => return error.ConnectionTimedOut,
-        else => |err| return std.posix.unexpectedErrno(err),
-    }
+        else => |err| std.posix.unexpectedErrno(err),
+    };
 }

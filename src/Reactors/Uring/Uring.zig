@@ -59,7 +59,9 @@ pub const ThreadContext = struct {
     }
 
     pub fn destroyOp(self: *ThreadContext, op: *Operation) void {
-        self.ops_buffer.destroy(op);
+        _ = self;
+        _ = op;
+        //self.ops_buffer.destroy(op);
     }
 };
 
@@ -87,6 +89,7 @@ pub fn init(allocator: Allocator) EventLoop {
 
 // File operation structures for async operations
 pub const Operation = struct {
+    exec: ?Reactor.Executer,
     waker: ?*anyopaque,
     result: i32,
     has_result: bool = false,
@@ -96,27 +99,21 @@ const vtable: Reactor.VTable = .{
     .createContext = createContext,
     .destroyContext = destroyContext,
     .onPark = onPark,
+    .destroyPoller = destroyPoller,
     .openFile = fs.openFile,
     .closeFile = fs.closeFile,
     .pread = fs.pread,
-    .awaitRead = fs.awaitRead,
     .pwrite = fs.pwrite,
-    .awaitWrite = fs.awaitWrite,
     .wakeThread = wakeThread,
     .sleep = sleep,
     .createSocket = net.createSocket,
-    .awaitCreateSocket = net.awaitCreateSocket,
     .closeSocket = net.closeSocket,
     .bind = net.bind,
     .listen = net.listen,
     .connect = net.connect,
-    .awaitConnect = net.awaitConnect,
     .accept = net.accept,
-    .awaitAccept = net.awaitAccept,
     .send = net.send,
-    .awaitSend = net.awaitSend,
     .recv = net.recv,
-    .awaitRecv = net.awaitRecv,
     .getStdIn = fs.getStdIn,
 };
 
@@ -144,6 +141,7 @@ fn sleep(ctx: ?*anyopaque, exec: Reactor.Executer, ms: u64) Cancelable!void {
         .waker = exec.getWaker(),
         .result = 0,
         .has_result = false,
+        .exec = exec,
     };
 
     var ts: std.os.linux.kernel_timespec = .{
@@ -175,6 +173,13 @@ fn sleep(ctx: ?*anyopaque, exec: Reactor.Executer, ms: u64) Cancelable!void {
     thread_ctx.destroyOp(op);
 }
 
+fn destroyPoller(global_ctx: ?*anyopaque, exec: Reactor.Executer, poller: Runtime.AnyPoller) void {
+    _ = global_ctx;
+    const thread_ctx: *ThreadContext = @alignCast(@ptrCast(exec.getThreadContext()));
+    const op: *Operation = @alignCast(@ptrCast(poller.poller_ctx));
+    thread_ctx.destroyOp(op);
+}
+
 fn wakeThread(global_ctx: ?*anyopaque, cur_thread_ctx: ?*anyopaque, other_thread_ctx: ?*anyopaque) void {
     _ = global_ctx;
     if (cur_thread_ctx) |thread| {
@@ -184,20 +189,17 @@ fn wakeThread(global_ctx: ?*anyopaque, cur_thread_ctx: ?*anyopaque, other_thread
         const sqe = cur_thread.getSqe() catch {
             @panic("failed to get sqe");
         };
-        const op = cur_thread.getOp() catch {
-            @panic("failed to get op");
-        };
-
-        op.* = .{ .waker = null, .result = 0, .has_result = true };
 
         sqe.prep_rw(
             .MSG_RING,
             other_thread.io_uring.fd,
             0,
             0,
+            // 0 is to wake up
             0,
         );
-        sqe.user_data = @intFromPtr(op);
+        // 1 is noop
+        sqe.user_data = 1;
     } else {
         const other_thread: *ThreadContext = @alignCast(@ptrCast(other_thread_ctx));
 
@@ -245,8 +247,13 @@ fn onPark(global_ctx: ?*anyopaque, exec: Reactor.Executer) void {
         var should_wake: bool = false;
         // Process completed operations
         for (cqes[0..completed]) |cqe| {
+            // wake up, someone gave us task to run
             if (cqe.user_data == 0) {
                 should_wake = true;
+                continue;
+            }
+            // noop
+            if (cqe.user_data == 1) {
                 continue;
             }
 

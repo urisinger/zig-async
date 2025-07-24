@@ -33,53 +33,16 @@ pub fn main() !void {
             break;
         }
     }
-    log.info("stopped", .{});
-}
-
-pub fn test1(rt: Runtime, sleep_amount: u64) void {
-    const read_bytes = 10;
-    const num_reads = 10;
-    var read_buffers: [num_reads][read_bytes]u8 = undefined;
-    var read_handles: [num_reads]*Runtime.File.AnyReadHandle = undefined;
-
-    const file: Runtime.File = rt.open("/dev/urandom", .{ .mode = .read_only }) catch |err| {
-        log.err("open error: {any}", .{err});
-        return;
-    };
-
-    rt.sleep(sleep_amount) catch |err| {
-        log.err("sleep error: {any}", .{err});
-        return;
-    };
-
-    log.info("sleeping for {d}ms", .{sleep_amount});
-
-    for (0..num_reads) |i| {
-        read_handles[i] = file.read(rt, &read_buffers[i]);
-    }
-
-    for (read_handles) |handle| {
-        const result = handle.@"await"(rt) catch |err| {
-            log.err("read error: {any}", .{err});
-            return;
-        };
-        log.info("read {d} bytes", .{result});
-    }
 }
 
 // Select style api.
 pub fn run(rt: Runtime, allocator: std.mem.Allocator) i32 {
-    var fut1 = Future(test1).init(.{ rt, 1000 });
-    var fut2 = Future(test1).init(.{ rt, 100 });
-
-    const result = rt.select(.{ &fut2, &fut1 });
-
-    log.info("result: {any}", .{result});
-
+    log.info("running", .{});
     const socket = rt.createSocket(.ipv4, .tcp) catch |err| {
         log.err("create socket error: {any}", .{err});
         return 1;
     };
+    log.info("socket: {any}", .{socket});
 
     defer socket.close(rt);
 
@@ -90,6 +53,7 @@ pub fn run(rt: Runtime, allocator: std.mem.Allocator) i32 {
         log.err("bind error: {any}", .{err});
         return 1;
     };
+    log.info("bound", .{});
 
     socket.listen(rt, 10) catch |err| {
         log.err("listen error: {any}", .{err});
@@ -104,6 +68,7 @@ pub fn run(rt: Runtime, allocator: std.mem.Allocator) i32 {
             log.err("accept error: {any}", .{err});
             break;
         };
+
         const task = rt.spawn(client_task, .{ rt, accept });
         tasks.append(task) catch |err| {
             log.err("spawn error: {any}", .{err});
@@ -116,9 +81,7 @@ pub fn run(rt: Runtime, allocator: std.mem.Allocator) i32 {
     }
 
     for (tasks.items) |task| {
-        task.join(rt) catch {
-            return 0;
-        };
+        task.join(rt);
     }
 
     return 0;
