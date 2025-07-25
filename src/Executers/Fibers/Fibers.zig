@@ -122,6 +122,16 @@ pub fn init(allocator: std.mem.Allocator, reactor: Reactor) !*Fibers {
     return rt;
 }
 
+pub fn cancelAll(self: *Fibers) void {
+    for (self.detached_tasks.list.items) |task| {
+        task.canceled.store(true, .release);
+        if (task.completed.load(.acquire)) {
+            continue;
+        }
+        self.reschedule(task);
+    }
+}
+
 pub fn deinit(self: *Fibers) void {
     // Signal shutdown to all threads
     self.shutdown.requested.store(true, .release);

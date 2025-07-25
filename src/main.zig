@@ -20,7 +20,7 @@ pub fn main() !void {
 
     const rt = fibers.runtime();
 
-    const handle = rt.spawn(run, .{ rt, allocator });
+    const handle = rt.spawn(run, .{rt});
 
     const stdin = std.io.getStdIn().reader();
     var buffer: [1024]u8 = undefined;
@@ -34,10 +34,12 @@ pub fn main() !void {
             break;
         }
     }
+
+    fibers.cancelAll();
 }
 
 // Select style api.
-pub fn run(rt: Runtime, allocator: std.mem.Allocator) i32 {
+pub fn run(rt: Runtime) i32 {
     log.info("running", .{});
     const socket = rt.createSocket(.ipv4, .tcp) catch |err| {
         log.err("create socket error: {any}", .{err});
@@ -67,28 +69,13 @@ pub fn run(rt: Runtime, allocator: std.mem.Allocator) i32 {
         return 1;
     };
 
-    var tasks = std.ArrayList(Runtime.SpawnHandle(void)).init(allocator);
-    defer tasks.deinit();
-
     while (true) {
         const accept = socket.accept(rt).@"await"(rt) catch |err| {
             log.err("accept error: {any}", .{err});
             break;
         };
 
-        const task = rt.spawn(client_task, .{ rt, accept });
-        tasks.append(task) catch |err| {
-            log.err("spawn error: {any}", .{err});
-            break;
-        };
-    }
-
-    for (tasks.items) |task| {
-        task.cancel(rt);
-    }
-
-    for (tasks.items) |*task| {
-        task.join(rt);
+        _ = rt.spawn(client_task, .{ rt, accept });
     }
 
     return 0;
