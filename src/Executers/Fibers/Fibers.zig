@@ -206,6 +206,8 @@ const Task = union(enum) {
 
     const Detached = struct {
         fiber: Fiber,
+        // Index in the detached_tasks list
+        index: usize,
         start: *const fn (context: *const anyopaque, result: *anyopaque) void,
         context_buf: []u8,
         context_alignment: Alignment,
@@ -298,6 +300,7 @@ const Task = union(enum) {
                 .waiter = .init(null),
                 .completed = .init(false),
                 .canceled = .init(false),
+                .index = undefined,
             };
 
             return task;
@@ -564,8 +567,10 @@ fn spawn(
     ) catch unreachable;
 
     rt.detached_tasks.mutex.lock();
+    const index = rt.detached_tasks.list.items.len;
     rt.detached_tasks.list.append(task) catch unreachable;
     rt.detached_tasks.mutex.unlock();
+    task.index = index;
 
     _ = rt.shutdown.task_count.fetchAdd(1, .acq_rel);
 
@@ -596,6 +601,13 @@ pub fn poll(ctx: ?*anyopaque, result: *anyopaque) bool {
     }
 
     @memcpy(result_buf, task.result_buf);
+
+    // Remove the task from the list
+    thread.rt.detached_tasks.mutex.lock();
+    _ = thread.rt.detached_tasks.list.swapRemove(task.index);
+    thread.rt.detached_tasks.mutex.unlock();
+    task.deinit();
+
     return true;
 }
 
