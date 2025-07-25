@@ -19,7 +19,7 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(lib);
 
     _ = b.addModule("zig_io", .{
-        .source_file = .{ .path = "src/root.zig" },
+        .root_source_file = .{ .path = "src/root.zig" },
     });
 
 
