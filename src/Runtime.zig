@@ -124,7 +124,7 @@ pub const AnyFuture = struct {
 
 // just a typed wrapper over poller
 pub const AnySpawnHandle = struct {
-    pooler: AnyPoller,
+    poller: AnyPoller,
 };
 
 pub const Cancelable = error{
@@ -322,8 +322,13 @@ pub fn SpawnHandle(comptime T: type) type {
         handle: AnySpawnHandle,
         result: T,
 
+        pub fn poll(self: Self) T {
+            const poller = self.handle.poller;
+            return poller.poll(poller.poller_ctx);
+        }
+
         pub fn any_poller(self: Self) AnyPoller {
-            return self.handle.pooler;
+            return self.handle.poller;
         }
 
         pub fn cancel(self: Self, runtime: Runtime) void {

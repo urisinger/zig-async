@@ -562,7 +562,7 @@ fn spawn(
     rt.schedule(task);
 
     return .{
-        .pooler = .{
+        .poller = .{
             .poll = @ptrCast(&poll),
             .poller_ctx = @ptrCast(task),
         },
@@ -593,7 +593,7 @@ pub fn poll(ctx: ?*anyopaque, result: *anyopaque) bool {
 
 fn cancel(ctx: ?*anyopaque, handle: Runtime.AnySpawnHandle) void {
     const rt: *Fibers = @alignCast(@ptrCast(ctx));
-    const task: *Task.Detached = @alignCast(@ptrCast(handle.pooler.poller_ctx));
+    const task: *Task.Detached = @alignCast(@ptrCast(handle.poller.poller_ctx));
     task.canceled.store(true, .release);
     if (task.completed.load(.acquire)) {
         log.info("task already completed", .{});
