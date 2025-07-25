@@ -269,6 +269,36 @@ pub fn send(ctx: ?*anyopaque, exec: Reactor.Executer, socket: Runtime.Socket, bu
     };
 }
 
+pub fn sendv(ctx: ?*anyopaque, exec: Reactor.Executer, socket: Runtime.Socket, buffers: []const Runtime.Socket.iovec) Runtime.Poller(Runtime.Socket.SendError!usize) {
+    _ = ctx;
+
+    const thread_ctx: *ThreadContext = @alignCast(@ptrCast(exec.getThreadContext()));
+
+    const sqe = thread_ctx.getSqe() catch {
+        @panic("failed to get sqe");
+    };
+
+    const op = thread_ctx.getOp() catch {
+        @panic("failed to get op");
+    };
+
+    op.* = .{
+        .waker = null,
+        .exec = exec,
+        .result = 0,
+        .has_result = false,
+    };
+
+    sqe.prep_writev(socket.handle, buffers, 0);
+    sqe.user_data = @intFromPtr(op);
+
+    return .{
+        .poll = @ptrCast(&pollSend),
+        .poller_ctx = @ptrCast(op),
+        .result = undefined,
+    };
+}
+
 pub fn pollSend(poller_ctx: ?*anyopaque) ?Runtime.Socket.SendError!usize {
     const op: *Operation = @ptrCast(@alignCast(poller_ctx));
 

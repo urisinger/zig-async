@@ -58,6 +58,8 @@ pub const VTable = struct {
     accept: *const fn (ctx: ?*anyopaque, socket: Socket) Poller(Socket.AcceptError!Socket),
 
     send: *const fn (ctx: ?*anyopaque, socket: Socket, buffer: []const u8, flags: Socket.SendFlags) Poller(Socket.SendError!usize),
+    // Like writev, but for sockets. likely uses writev internally.
+    sendv: *const fn (ctx: ?*anyopaque, socket: Socket, buffers: []const Socket.iovec) Poller(Socket.SendError!usize),
     recv: *const fn (ctx: ?*anyopaque, socket: Socket, buffer: []u8, flags: Socket.RecvFlags) Poller(Socket.RecvError!usize),
 
     sleep: *const fn (ctx: ?*anyopaque, ms: u64) Cancelable!void,
@@ -186,6 +188,8 @@ pub const Socket = struct {
         waitall: bool = false,
     };
 
+    pub const iovec = std.posix.iovec_const;
+
     pub fn close(socket: Socket, runtime: Runtime) void {
         return runtime.vtable.closeSocket(runtime.ctx, socket);
     }
@@ -210,10 +214,21 @@ pub const Socket = struct {
         return runtime.vtable.send(runtime.ctx, socket, buffer, flags);
     }
 
-    pub fn sendAll(socket: Socket, runtime: Runtime, buffer: []const u8, flags: SendFlags) SendError!void{
+    pub fn sendAll(socket: Socket, runtime: Runtime, buffer: []const u8, flags: SendFlags) SendError!void {
         var index: usize = 0;
         while (index < buffer.len) {
             index += try socket.send(runtime, buffer[index..], flags).@"await"(runtime);
+        }
+    }
+
+    pub fn sendv(socket: Socket, runtime: Runtime, buffers: []const Socket.iovec) Poller(SendError!usize) {
+        return runtime.vtable.sendv(runtime.ctx, socket, buffers);
+    }
+
+    pub fn sendvAll(socket: Socket, runtime: Runtime, buffers: []const Socket.iovec) SendError!void {
+        var index: usize = 0;
+        while (index < buffers.len) {
+            index += try socket.sendv(runtime, buffers[index..]).@"await"(runtime);
         }
     }
 
@@ -221,7 +236,7 @@ pub const Socket = struct {
         return runtime.vtable.recv(runtime.ctx, socket, buffer, flags);
     }
 
-    pub fn recvAll(socket: Socket, runtime: Runtime, buffer: []const u8, flags: RecvFlags) SendError!void{
+    pub fn recvAll(socket: Socket, runtime: Runtime, buffer: []const u8, flags: RecvFlags) SendError!void {
         var index: usize = 0;
         while (index < buffer.len) {
             index += try socket.recv(runtime, buffer[index..], flags).@"await"(runtime);

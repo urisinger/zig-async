@@ -66,6 +66,7 @@ const rt_vtable: Runtime.VTable = .{
     .connect = connect,
     .accept = accept,
     .send = send,
+    .sendv = sendv,
     .recv = recv,
 
     .getStdIn = getStdIn,
@@ -856,6 +857,11 @@ fn accept(ctx: ?*anyopaque, socket: Runtime.Socket) Runtime.Poller(Runtime.Socke
 fn send(ctx: ?*anyopaque, socket: Runtime.Socket, buffer: []const u8, flags: Runtime.Socket.SendFlags) Runtime.Poller(Runtime.Socket.SendError!usize) {
     const rt: *Fibers = @alignCast(@ptrCast(ctx));
     return rt.reactor.vtable.send(rt.reactor.ctx, rt.executer(), socket, buffer, flags);
+}
+
+fn sendv(ctx: ?*anyopaque, socket: Runtime.Socket, buffers: []const Runtime.Socket.iovec) Runtime.Poller(Runtime.Socket.SendError!usize) {
+    const rt: *Fibers = @alignCast(@ptrCast(ctx));
+    return rt.reactor.vtable.sendv(rt.reactor.ctx, rt.executer(), socket, buffers);
 }
 
 fn recv(ctx: ?*anyopaque, socket: Runtime.Socket, buffer: []u8, flags: Runtime.Socket.RecvFlags) Runtime.Poller(Runtime.Socket.RecvError!usize) {

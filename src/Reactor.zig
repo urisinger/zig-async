@@ -75,6 +75,7 @@ pub const VTable = struct {
     accept: *const fn (global_ctx: ?*anyopaque, executer: Executer, socket: Socket) Runtime.Poller(Socket.AcceptError!Socket),
 
     send: *const fn (global_ctx: ?*anyopaque, executer: Executer, socket: Socket, buffer: []const u8, flags: Socket.SendFlags) Runtime.Poller(Socket.SendError!usize),
+    sendv: *const fn (global_ctx: ?*anyopaque, executer: Executer, socket: Socket, buffers: []const Socket.iovec) Runtime.Poller(Socket.SendError!usize),
     recv: *const fn (global_ctx: ?*anyopaque, executer: Executer, socket: Socket, buffer: []u8, flags: Socket.RecvFlags) Runtime.Poller(Socket.RecvError!usize),
 
     sleep: *const fn (global_ctx: ?*anyopaque, executer: Executer, timestamp: u64) Cancelable!void,

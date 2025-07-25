@@ -114,6 +114,7 @@ const vtable: Reactor.VTable = .{
     .connect = net.connect,
     .accept = net.accept,
     .send = net.send,
+    .sendv = net.sendv,
     .recv = net.recv,
     .getStdIn = fs.getStdIn,
 };
