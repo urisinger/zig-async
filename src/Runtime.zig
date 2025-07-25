@@ -213,7 +213,7 @@ pub const Socket = struct {
     pub fn sendAll(socket: Socket, runtime: Runtime, buffer: []const u8, flags: SendFlags) SendError!usize{
         var index: usize = 0;
         while (index < buffer.len) {
-            index += try socket.send(runtime, buffer[index..], flags);
+            index += try socket.send(runtime, buffer[index..], flags).@"await"(runtime);
         }
     }
 
@@ -224,7 +224,7 @@ pub const Socket = struct {
     pub fn recvAll(socket: Socket, runtime: Runtime, buffer: []const u8, flags: RecvFlags) SendError!usize{
         var index: usize = 0;
         while (index < buffer.len) {
-            index += try socket.recv(runtime, buffer[index..], flags);
+            index += try socket.recv(runtime, buffer[index..], flags).@"await"(runtime);
         }
     }
 
