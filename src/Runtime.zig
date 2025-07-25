@@ -124,7 +124,8 @@ pub const AnyFuture = struct {
 
 // just a typed wrapper over poller
 pub const AnySpawnHandle = struct {
-    poller: AnyPoller,
+    poll: *const fn (ctx: ?*anyopaque, result: *anyopaque) bool,
+    ctx: ?*anyopaque,
 };
 
 pub const Cancelable = error{
@@ -320,23 +321,46 @@ pub fn SpawnHandle(comptime T: type) type {
     return struct {
         const Self = @This();
         handle: AnySpawnHandle,
+        has_result: bool = false,
         result: T,
 
-        pub fn poll(self: Self) T {
-            const poller = self.handle.poller;
-            return poller.poll(poller.poller_ctx);
+        pub fn poll(self: Self) ?T {
+            if (self.has_result) {
+                return self.result;
+            }
+            if (self.handle.poll(self.handle.ctx, &self.result)) {
+                self.has_result = true;
+                return self.result;
+            }
+            return null;
         }
 
-        pub fn any_poller(self: Self) AnyPoller {
-            return self.handle.poller;
+        pub fn any_poller(self: *Self) AnyPoller {
+            const TypeErased = struct {
+                fn poll(poller_ctx: ?*anyopaque) bool {
+                    const self_casted: *Self = @alignCast(@ptrCast(poller_ctx));
+                    if (self_casted.has_result) {
+                        return true;
+                    }
+                    if (self_casted.handle.poll(self_casted.handle.ctx, &self_casted.result)) {
+                        self_casted.has_result = true;
+                        return true;
+                    }
+                    return false;
+                }
+            };
+            return .{
+                .poll = @ptrCast(&TypeErased.poll),
+                .poller_ctx = @ptrCast(self),
+            };
         }
 
         pub fn cancel(self: Self, runtime: Runtime) void {
             runtime.vtable.cancel(runtime.ctx, self.handle);
         }
 
-        pub fn join(self: Self, runtime: Runtime) T {
-            return runtime.join(.{&self}).@"0";
+        pub fn join(self: *Self, runtime: Runtime) T {
+            return runtime.join(.{self}).@"0";
         }
     };
 }

@@ -87,7 +87,7 @@ pub fn run(rt: Runtime, allocator: std.mem.Allocator) i32 {
         task.cancel(rt);
     }
 
-    for (tasks.items) |task| {
+    for (tasks.items) |*task| {
         task.join(rt);
     }
 
