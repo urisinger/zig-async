@@ -177,13 +177,11 @@ pub const Socket = struct {
     pub const SetOptError = std.posix.SetSockOptError;
 
     pub const SendFlags = struct {
-        dontwait: bool = false,
         more: bool = false,
         nosignal: bool = false,
     };
 
     pub const RecvFlags = struct {
-        dontwait: bool = false,
         peek: bool = false,
         waitall: bool = false,
     };

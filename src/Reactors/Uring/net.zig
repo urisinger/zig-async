@@ -257,7 +257,6 @@ pub fn send(ctx: ?*anyopaque, exec: Reactor.Executer, socket: Runtime.Socket, bu
 
     var flags_int: u32 = 0;
     if (flags.more) flags_int |= std.os.linux.MSG.MORE;
-    if (flags.dontwait) flags_int |= std.os.linux.MSG.DONTWAIT;
     if (flags.nosignal) flags_int |= std.os.linux.MSG.NOSIGNAL;
 
     sqe.prep_send(socket.handle, buffer, flags_int);
@@ -329,7 +328,6 @@ pub fn recv(ctx: ?*anyopaque, exec: Reactor.Executer, socket: Runtime.Socket, bu
     var flags_int: u32 = 0;
     if (flags.peek) flags_int |= std.os.linux.MSG.PEEK;
     if (flags.waitall) flags_int |= std.os.linux.MSG.WAITALL;
-    if (flags.dontwait) flags_int |= std.os.linux.MSG.DONTWAIT;
 
     sqe.prep_recv(socket.handle, buffer, flags_int);
     sqe.user_data = @intFromPtr(op);
