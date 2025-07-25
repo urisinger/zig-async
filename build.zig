@@ -12,18 +12,16 @@ pub fn build(b: *std.Build) void {
     });
 
     const lib = b.addLibrary(.{
+        .linkage = .static,
         .name = "zig_io",
         .root_module = lib_mod,
     });
     b.installArtifact(lib);
 
-
-    b.addStaticLibrary(.{
-        .name = "zig_io",
-        .root_source_file = b.path("src/root.zig"),
-        .target = target,
-        .optimize = optimize,
+    _ = b.addModule("zig_io", .{
+        .source_file = .{ .path = "src/root.zig" },
     });
+
 
     const exe_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
