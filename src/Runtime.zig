@@ -210,8 +210,22 @@ pub const Socket = struct {
         return runtime.vtable.send(runtime.ctx, socket, buffer, flags);
     }
 
+    pub fn sendAll(socket: Socket, runtime: Runtime, buffer: []const u8, flags: SendFlags) SendError!usize{
+        var index: usize = 0;
+        while (index < buffer.len) {
+            index += try socket.send(runtime, buffer[index..], flags);
+        }
+    }
+
     pub fn recv(socket: Socket, runtime: Runtime, buffer: []u8, flags: RecvFlags) Poller(RecvError!usize) {
         return runtime.vtable.recv(runtime.ctx, socket, buffer, flags);
+    }
+
+    pub fn recvAll(socket: Socket, runtime: Runtime, buffer: []const u8, flags: RecvFlags) SendError!usize{
+        var index: usize = 0;
+        while (index < buffer.len) {
+            index += try socket.recv(runtime, buffer[index..], flags);
+        }
     }
 
     pub const Address = std.posix.sockaddr;
