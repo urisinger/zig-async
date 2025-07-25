@@ -1,9 +1,10 @@
 const std = @import("std");
 const log = std.log.scoped(.main);
-const Runtime = @import("Runtime.zig");
+const zig_io = @import("zig_io");
+const Runtime = zig_io.Runtime;
 const Future = Runtime.Future;
-const Fibers = @import("Executers/Fibers/Fibers.zig");
-const Uring = @import("Reactors/Uring/Uring.zig");
+const Fibers = zig_io.Fibers;
+const Uring = zig_io.Uring;
 
 const os = std.os;
 
