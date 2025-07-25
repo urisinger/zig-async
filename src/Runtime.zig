@@ -210,7 +210,7 @@ pub const Socket = struct {
         return runtime.vtable.send(runtime.ctx, socket, buffer, flags);
     }
 
-    pub fn sendAll(socket: Socket, runtime: Runtime, buffer: []const u8, flags: SendFlags) SendError!usize{
+    pub fn sendAll(socket: Socket, runtime: Runtime, buffer: []const u8, flags: SendFlags) SendError!void{
         var index: usize = 0;
         while (index < buffer.len) {
             index += try socket.send(runtime, buffer[index..], flags).@"await"(runtime);
@@ -221,7 +221,7 @@ pub const Socket = struct {
         return runtime.vtable.recv(runtime.ctx, socket, buffer, flags);
     }
 
-    pub fn recvAll(socket: Socket, runtime: Runtime, buffer: []const u8, flags: RecvFlags) SendError!usize{
+    pub fn recvAll(socket: Socket, runtime: Runtime, buffer: []const u8, flags: RecvFlags) SendError!void{
         var index: usize = 0;
         while (index < buffer.len) {
             index += try socket.recv(runtime, buffer[index..], flags).@"await"(runtime);
