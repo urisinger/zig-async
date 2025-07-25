@@ -18,6 +18,13 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(lib);
 
 
+    b.addStaticLibrary(.{
+        .name = "zig_io",
+        .root_source_file = b.path("src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     const exe_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
