@@ -108,6 +108,7 @@ const vtable: Reactor.VTable = .{
     .sleep = sleep,
     .createSocket = net.createSocket,
     .closeSocket = net.closeSocket,
+    .setsockopt = net.setsockopt,
     .bind = net.bind,
     .listen = net.listen,
     .connect = net.connect,

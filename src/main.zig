@@ -43,6 +43,12 @@ pub fn run(rt: Runtime, allocator: std.mem.Allocator) i32 {
         log.err("create socket error: {any}", .{err});
         return 1;
     };
+
+    socket.setsockopt(rt, .{ .reuseaddr = true }) catch |err| {
+        log.err("setsockopt error: {any}", .{err});
+        return 1;
+    };
+
     log.info("socket: {any}", .{socket});
 
     defer socket.close(rt);

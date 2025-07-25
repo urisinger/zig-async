@@ -65,6 +65,7 @@ pub const VTable = struct {
 
     createSocket: *const fn (global_ctx: ?*anyopaque, executer: Executer, domain: Socket.Domain, protocol: Socket.Protocol) Runtime.Poller(Socket.CreateError!Socket),
     closeSocket: *const fn (global_ctx: ?*anyopaque, executer: Executer, socket: Socket) void,
+    setsockopt: *const fn (global_ctx: ?*anyopaque, executer: Executer, socket: Socket, option: Socket.Option) Socket.SetOptError!void,
 
     bind: *const fn (global_ctx: ?*anyopaque, executer: Executer, socket: Socket, address: *const Socket.Address, length: u32) Socket.BindError!void,
     listen: *const fn (global_ctx: ?*anyopaque, executer: Executer, socket: Socket, backlog: u32) Socket.ListenError!void,

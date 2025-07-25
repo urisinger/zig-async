@@ -60,6 +60,7 @@ const rt_vtable: Runtime.VTable = .{
 
     .createSocket = createSocket,
     .closeSocket = closeSocket,
+    .setsockopt = setsockopt,
     .bind = bind,
     .listen = listen,
     .connect = connect,
@@ -825,6 +826,11 @@ fn createSocket(ctx: ?*anyopaque, domain: Runtime.Socket.Domain, protocol: Runti
 fn closeSocket(ctx: ?*anyopaque, socket: Runtime.Socket) void {
     const rt: *Fibers = @alignCast(@ptrCast(ctx));
     rt.reactor.vtable.closeSocket(rt.reactor.ctx, rt.executer(), socket);
+}
+
+fn setsockopt(ctx: ?*anyopaque, socket: Runtime.Socket, option: Runtime.Socket.Option) Runtime.Socket.SetOptError!void {
+    const rt: *Fibers = @alignCast(@ptrCast(ctx));
+    return rt.reactor.vtable.setsockopt(rt.reactor.ctx, rt.executer(), socket, option);
 }
 
 fn bind(ctx: ?*anyopaque, socket: Runtime.Socket, address: *const Runtime.Socket.Address, length: u32) Runtime.Socket.BindError!void {

@@ -48,6 +48,7 @@ pub const VTable = struct {
 
     createSocket: *const fn (ctx: ?*anyopaque, domain: Socket.Domain, protocol: Socket.Protocol) Poller(Socket.CreateError!Socket),
     closeSocket: *const fn (ctx: ?*anyopaque, socket: Socket) void,
+    setsockopt: *const fn (ctx: ?*anyopaque, socket: Socket, option: Socket.Option) Socket.SetOptError!void,
 
     bind: *const fn (ctx: ?*anyopaque, socket: Socket, address: *const Socket.Address, length: u32) Socket.BindError!void,
     listen: *const fn (ctx: ?*anyopaque, socket: Socket, backlog: u32) Socket.ListenError!void,
@@ -145,6 +146,27 @@ pub const Socket = struct {
         default,
     };
 
+    pub const Option = union(enum) {
+        /// Allow reuse of local addresses (SO_REUSEADDR)
+        reuseaddr: bool,
+        /// Allow reuse of local ports (SO_REUSEPORT)
+        reuseport: bool,
+        /// Enable keep-alive (SO_KEEPALIVE)
+        keepalive: bool,
+        /// Receive buffer size (SO_RCVBUF)
+        rcvbuf: u32,
+        /// Send buffer size (SO_SNDBUF)
+        sndbuf: u32,
+        /// Receive timeout in milliseconds (SO_RCVTIMEO)
+        rcvtimeo: u32,
+        /// Send timeout in milliseconds (SO_SNDTIMEO)
+        sndtimeo: u32,
+        /// Disable Nagle's algorithm (TCP_NODELAY)
+        nodelay: bool,
+        /// Enable broadcast (SO_BROADCAST)
+        broadcast: bool,
+    };
+
     pub const AcceptError = Cancelable || std.posix.AcceptError;
     pub const CreateError = Cancelable || std.posix.SocketError;
     pub const BindError = std.posix.BindError;
@@ -152,6 +174,7 @@ pub const Socket = struct {
     pub const SendError = Cancelable || std.posix.SendError;
     pub const RecvError = Cancelable || std.posix.RecvFromError;
     pub const ListenError = std.posix.ListenError;
+    pub const SetOptError = std.posix.SetSockOptError;
 
     pub const SendFlags = struct {
         dontwait: bool = false,
@@ -167,6 +190,10 @@ pub const Socket = struct {
 
     pub fn close(socket: Socket, runtime: Runtime) void {
         return runtime.vtable.closeSocket(runtime.ctx, socket);
+    }
+
+    pub fn setsockopt(socket: Socket, runtime: Runtime, option: Socket.Option) SetOptError!void {
+        return runtime.vtable.setsockopt(runtime.ctx, socket, option);
     }
 
     pub fn bind(socket: Socket, runtime: Runtime, address: *const Socket.Address, length: u32) BindError!void {

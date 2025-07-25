@@ -372,3 +372,53 @@ pub fn pollRecv(poller_ctx: ?*anyopaque) ?Runtime.Socket.RecvError!usize {
         else => |err| std.posix.unexpectedErrno(err),
     };
 }
+
+pub fn setsockopt(ctx: ?*anyopaque, exec: Reactor.Executer, socket: Runtime.Socket, option: Runtime.Socket.Option) Runtime.Socket.SetOptError!void {
+    _ = ctx;
+    _ = exec;
+
+    switch (option) {
+        .reuseaddr => |value| {
+            const int_value: c_int = if (value) 1 else 0;
+            try std.posix.setsockopt(socket.handle, std.posix.SOL.SOCKET, std.posix.SO.REUSEADDR, std.mem.asBytes(&int_value));
+        },
+        .reuseport => |value| {
+            const int_value: c_int = if (value) 1 else 0;
+            try std.posix.setsockopt(socket.handle, std.posix.SOL.SOCKET, std.posix.SO.REUSEPORT, std.mem.asBytes(&int_value));
+        },
+        .keepalive => |value| {
+            const int_value: c_int = if (value) 1 else 0;
+            try std.posix.setsockopt(socket.handle, std.posix.SOL.SOCKET, std.posix.SO.KEEPALIVE, std.mem.asBytes(&int_value));
+        },
+        .rcvbuf => |value| {
+            const int_value: c_int = @intCast(value);
+            try std.posix.setsockopt(socket.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVBUF, std.mem.asBytes(&int_value));
+        },
+        .sndbuf => |value| {
+            const int_value: c_int = @intCast(value);
+            try std.posix.setsockopt(socket.handle, std.posix.SOL.SOCKET, std.posix.SO.SNDBUF, std.mem.asBytes(&int_value));
+        },
+        .rcvtimeo => |value| {
+            const timeval = std.posix.timeval{
+                .sec = @intCast(value / 1000),
+                .usec = @intCast((value % 1000) * 1000),
+            };
+            try std.posix.setsockopt(socket.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&timeval));
+        },
+        .sndtimeo => |value| {
+            const timeval = std.posix.timeval{
+                .sec = @intCast(value / 1000),
+                .usec = @intCast((value % 1000) * 1000),
+            };
+            try std.posix.setsockopt(socket.handle, std.posix.SOL.SOCKET, std.posix.SO.SNDTIMEO, std.mem.asBytes(&timeval));
+        },
+        .nodelay => |value| {
+            const int_value: c_int = if (value) 1 else 0;
+            try std.posix.setsockopt(socket.handle, std.posix.IPPROTO.TCP, std.posix.TCP.NODELAY, std.mem.asBytes(&int_value));
+        },
+        .broadcast => |value| {
+            const int_value: c_int = if (value) 1 else 0;
+            try std.posix.setsockopt(socket.handle, std.posix.SOL.SOCKET, std.posix.SO.BROADCAST, std.mem.asBytes(&int_value));
+        },
+    }
+}
