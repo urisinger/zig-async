@@ -1,11 +1,11 @@
 const std = @import("std");
 const builtin = @import("builtin");
-const root = @import("root");
+const root = @import("zig_io");
 
 const Alignment = std.mem.Alignment;
 
-const Runtime = @import("../../Runtime.zig");
-const Reactor = @import("../../Reactor.zig");
+const Runtime = root.Runtime;
+const Reactor = root.Reactor;
 const Context = @import("./context.zig").Context;
 const contextSwitch = @import("./context.zig").contextSwitch;
 const Cancelable = Runtime.Cancelable;
@@ -48,6 +48,7 @@ shutdown: struct {
 reactor: Reactor,
 const rt_vtable: Runtime.VTable = .{
     .spawn = spawn,
+    .@"await" = @"await",
     .cancel = cancel,
     .select = select,
     .join = join,
@@ -58,16 +59,17 @@ const rt_vtable: Runtime.VTable = .{
     .pwrite = pwrite,
     .sleep = sleep,
 
-    .createSocket = createSocket,
-    .closeSocket = closeSocket,
-    .setsockopt = setsockopt,
-    .bind = bind,
     .listen = listen,
-    .connect = connect,
     .accept = accept,
-    .send = send,
-    .sendv = sendv,
-    .recv = recv,
+
+    .writeStream = writeStream,
+    .writevStream = writevStream,
+
+    .readStream = readStream,
+    .readvStream = readvStream,
+
+    .closeStream = closeStream,
+    .closeServer = closeServer,
 
     .getStdIn = getStdIn,
 };
@@ -555,7 +557,7 @@ fn spawn(
     result_len: usize,
     result_alignment: std.mem.Alignment,
     start: *const fn (context: *const anyopaque, result: *anyopaque) void,
-) Runtime.AnySpawnHandle {
+) *Runtime.AnySpawnHandle {
     const rt: *Fibers = @alignCast(@ptrCast(ctx));
 
     const task = Task.Detached.init(
@@ -576,14 +578,12 @@ fn spawn(
 
     rt.schedule(task);
 
-    return .{
-        .poll = @ptrCast(&poll),
-        .ctx = @ptrCast(task),
-    };
+    return @ptrCast(task);
 }
 
-pub fn poll(ctx: ?*anyopaque, result: *anyopaque) bool {
-    const task: *Task.Detached = @alignCast(@ptrCast(ctx));
+pub fn @"await"(ctx: ?*anyopaque, handle: *Runtime.AnySpawnHandle, result: *anyopaque) void {
+    _ = ctx;
+    const task: *Task.Detached = @alignCast(@ptrCast(handle));
     const result_buf: []u8 = @as([*]u8, @ptrCast(result))[0..task.result_buf.len];
 
     const thread = Thread.current();
@@ -591,13 +591,19 @@ pub fn poll(ctx: ?*anyopaque, result: *anyopaque) bool {
 
     task.waiter.store(current_task, .release);
 
-    if (current_task.canceled.load(.acquire)) {
-        task.canceled.store(true, .release);
-        thread.rt.reschedule(task);
-    }
+    while (true) {
+        if (current_task.canceled.load(.acquire)) {
+            task.canceled.store(true, .release);
+            thread.rt.reschedule(task);
+        }
 
-    if (!task.completed.load(.acquire)) {
-        return false;
+        if (task.completed.load(.acquire)) {
+            break;
+        }
+        if (Task.current().yeild()) {
+            task.canceled.store(true, .release);
+            thread.rt.reschedule(task);
+        }
     }
 
     @memcpy(result_buf, task.result_buf);
@@ -605,15 +611,17 @@ pub fn poll(ctx: ?*anyopaque, result: *anyopaque) bool {
     // Remove the task from the list
     thread.rt.detached_tasks.mutex.lock();
     _ = thread.rt.detached_tasks.list.swapRemove(task.index);
+    // If we removed an element that wasn't the last one, update the index of the element that was moved
+    if (task.index < thread.rt.detached_tasks.list.items.len) {
+        thread.rt.detached_tasks.list.items[task.index].index = task.index;
+    }
     thread.rt.detached_tasks.mutex.unlock();
     task.deinit();
-
-    return true;
 }
 
-fn cancel(ctx: ?*anyopaque, handle: Runtime.AnySpawnHandle) void {
+fn cancel(ctx: ?*anyopaque, handle: *Runtime.AnySpawnHandle) void {
     const rt: *Fibers = @alignCast(@ptrCast(ctx));
-    const task: *Task.Detached = @alignCast(@ptrCast(handle.ctx));
+    const task: *Task.Detached = @alignCast(@ptrCast(handle));
     task.canceled.store(true, .release);
     if (task.completed.load(.acquire)) {
         log.info("task already completed", .{});
@@ -624,42 +632,22 @@ fn cancel(ctx: ?*anyopaque, handle: Runtime.AnySpawnHandle) void {
 
 fn select(
     ctx: ?*anyopaque,
-    futures: []Runtime.FutureOrPoller,
+    futures: []Runtime.AnyFuture,
 ) usize {
-    const rt: *Fibers = @alignCast(@ptrCast(ctx));
+    _ = ctx;
     const me = Task.current();
 
     // Create linked list of task nodes
 
     var i: usize = 0;
     for (futures) |*afut| {
-        switch (afut.*) {
-            .future => |future| {
-                const node = Task.Async.init(
-                    future.start,
-                    @ptrCast(future.arg),
-                    me,
-                ) catch unreachable;
+        const node = Task.Async.init(
+            afut.start,
+            @ptrCast(afut.arg),
+            me,
+        ) catch unreachable;
 
-                afut.*.future.metadata = @ptrCast(node);
-            },
-            .poller => |poller| {
-                if (poller.poll(poller.poller_ctx)) {
-                    for (0..i) |j| {
-                        switch (futures[j]) {
-                            .future => |future| {
-                                const task: *Task.Async = @alignCast(@ptrCast(future.metadata));
-                                task.deinit();
-                            },
-                            .poller => |cleanup_poller| {
-                                rt.reactor.vtable.destroyPoller(rt.reactor.ctx, rt.executer(), cleanup_poller);
-                            },
-                        }
-                    }
-                    return i;
-                }
-            },
-        }
+        afut.metadata = @ptrCast(node);
 
         i += 1;
     }
@@ -669,92 +657,59 @@ fn select(
         var index: usize = 0;
 
         for (futures) |afut| {
-            switch (afut) {
-                .future => |future| {
-                    const task: *Task.Async = @alignCast(@ptrCast(future.metadata));
-                    Task.cur = .{
-                        .@"async" = task,
-                    };
-                    if (task.finished) {
-                        break :outer index;
-                    }
-                    contextSwitch(&me.fiber().ctx, &task.fiber.ctx);
-                    if (task.finished) {
-                        break :outer index;
-                    }
-                },
-                .poller => |poller| {
-                    if (poller.poll(poller.poller_ctx)) {
-                        break :outer index;
-                    }
-                },
+            const task: *Task.Async = @alignCast(@ptrCast(afut.metadata));
+            Task.cur = .{
+                .@"async" = task,
+            };
+            if (task.finished) {
+                break :outer index;
+            }
+            contextSwitch(&me.fiber().ctx, &task.fiber.ctx);
+            if (task.finished) {
+                break :outer index;
             }
             index += 1;
         }
-        if (Task.current().yeild()) {}
+        _ = Task.current().yeild();
     };
 
     // Clean up linked list
     for (futures) |*afut| {
-        switch (afut.*) {
-            .future => |future| {
-                const task: *Task.Async = @alignCast(@ptrCast(future.metadata));
-                task.deinit();
-            },
-            .poller => |poller| {
-                rt.reactor.vtable.destroyPoller(rt.reactor.ctx, rt.executer(), poller);
-            },
-        }
+        const task: *Task.Async = @alignCast(@ptrCast(afut.metadata));
+        task.deinit();
     }
 
     return result;
 }
 
-fn join(ctx: ?*anyopaque, futures: []Runtime.FutureOrPoller) void {
-    const rt: *Fibers = @alignCast(@ptrCast(ctx));
+fn join(ctx: ?*anyopaque, futures: []Runtime.AnyFuture) void {
+    _ = ctx;
     const me = Task.current();
 
     // Create async tasks for futures
     for (futures) |*afut| {
-        switch (afut.*) {
-            .future => |future| {
-                const node = Task.Async.init(
-                    future.start,
-                    @ptrCast(future.arg),
-                    me,
-                ) catch unreachable;
+        const node = Task.Async.init(
+            afut.start,
+            @ptrCast(afut.arg),
+            me,
+        ) catch unreachable;
 
-                afut.*.future.metadata = @ptrCast(node);
-            },
-            .poller => |poller| {
-                // Pollers don't need async tasks, we'll check them directly
-                _ = poller;
-            },
-        }
+        afut.metadata = @ptrCast(node);
     }
 
     while (true) {
         var all_finished = true;
 
         for (futures) |afut| {
-            switch (afut) {
-                .future => |future| {
-                    const task: *Task.Async = @alignCast(@ptrCast(future.metadata));
-                    Task.cur = .{
-                        .@"async" = task,
-                    };
-                    if (!task.finished) {
-                        contextSwitch(&me.fiber().ctx, &task.fiber.ctx);
-                        if (!task.finished) {
-                            all_finished = false;
-                        }
-                    }
-                },
-                .poller => |poller| {
-                    if (!poller.poll(poller.poller_ctx)) {
-                        all_finished = false;
-                    }
-                },
+            const task: *Task.Async = @alignCast(@ptrCast(afut.metadata));
+            Task.cur = .{
+                .@"async" = task,
+            };
+            if (!task.finished) {
+                contextSwitch(&me.fiber().ctx, &task.fiber.ctx);
+                if (!task.finished) {
+                    all_finished = false;
+                }
             }
         }
 
@@ -767,15 +722,8 @@ fn join(ctx: ?*anyopaque, futures: []Runtime.FutureOrPoller) void {
 
     // Clean up async tasks
     for (futures) |*afut| {
-        switch (afut.*) {
-            .future => |future| {
-                const task: *Task.Async = @alignCast(@ptrCast(future.metadata));
-                task.deinit();
-            },
-            .poller => |poller| {
-                rt.reactor.vtable.destroyPoller(rt.reactor.ctx, rt.executer(), poller);
-            },
-        }
+        const task: *Task.Async = @alignCast(@ptrCast(afut.metadata));
+        task.deinit();
     }
 }
 
@@ -824,12 +772,12 @@ fn closeFile(ctx: ?*anyopaque, file: Runtime.File) void {
     rt.reactor.vtable.closeFile(rt.reactor.ctx, rt.executer(), file);
 }
 
-fn pread(ctx: ?*anyopaque, file: Runtime.File, buffer: []u8, offset: std.posix.off_t) Runtime.Poller(Runtime.File.PReadError!usize) {
+fn pread(ctx: ?*anyopaque, file: Runtime.File, buffer: []u8, offset: std.posix.off_t) Runtime.File.PReadError!usize {
     const rt: *Fibers = @alignCast(@ptrCast(ctx));
     return rt.reactor.vtable.pread(rt.reactor.ctx, rt.executer(), file, buffer, offset);
 }
 
-fn pwrite(ctx: ?*anyopaque, file: Runtime.File, buffer: []const u8, offset: std.posix.off_t) Runtime.Poller(Runtime.File.PWriteError!usize) {
+fn pwrite(ctx: ?*anyopaque, file: Runtime.File, buffer: []const u8, offset: std.posix.off_t) Runtime.File.PWriteError!usize {
     const rt: *Fibers = @alignCast(@ptrCast(ctx));
     return rt.reactor.vtable.pwrite(rt.reactor.ctx, rt.executer(), file, buffer, offset);
 }
@@ -839,54 +787,44 @@ fn sleep(ctx: ?*anyopaque, ms: u64) Cancelable!void {
     try rt.reactor.vtable.sleep(rt.reactor.ctx, rt.executer(), ms);
 }
 
-fn createSocket(ctx: ?*anyopaque, domain: Runtime.Socket.Domain, protocol: Runtime.Socket.Protocol) Runtime.Poller(Runtime.Socket.CreateError!Runtime.Socket) {
+fn listen(ctx: ?*anyopaque, address: Runtime.net.Address, options: Runtime.net.Server.ListenOptions) Runtime.net.Server.ListenError!Runtime.net.Server {
     const rt: *Fibers = @alignCast(@ptrCast(ctx));
-    return rt.reactor.vtable.createSocket(rt.reactor.ctx, rt.executer(), domain, protocol);
+    return rt.reactor.vtable.listen(rt.reactor.ctx, rt.executer(), address, options);
 }
 
-fn closeSocket(ctx: ?*anyopaque, socket: Runtime.Socket) void {
+fn accept(ctx: ?*anyopaque, server: Runtime.net.Server) Runtime.net.Server.AcceptError!Runtime.net.Stream {
     const rt: *Fibers = @alignCast(@ptrCast(ctx));
-    rt.reactor.vtable.closeSocket(rt.reactor.ctx, rt.executer(), socket);
+    return rt.reactor.vtable.accept(rt.reactor.ctx, rt.executer(), server);
 }
 
-fn setsockopt(ctx: ?*anyopaque, socket: Runtime.Socket, option: Runtime.Socket.Option) Runtime.Socket.SetOptError!void {
+fn writeStream(ctx: ?*anyopaque, stream: Runtime.net.Stream, buffer: []const u8) Runtime.net.Stream.WriteError!usize {
     const rt: *Fibers = @alignCast(@ptrCast(ctx));
-    return rt.reactor.vtable.setsockopt(rt.reactor.ctx, rt.executer(), socket, option);
+    return rt.reactor.vtable.writeStream(rt.reactor.ctx, rt.executer(), stream, buffer);
 }
 
-fn bind(ctx: ?*anyopaque, socket: Runtime.Socket, address: *const Runtime.Socket.Address, length: u32) Runtime.Socket.BindError!void {
+fn writevStream(ctx: ?*anyopaque, stream: Runtime.net.Stream, iovecs: []const Runtime.net.Stream.iovec_const) Runtime.net.Stream.WriteError!usize {
     const rt: *Fibers = @alignCast(@ptrCast(ctx));
-    try rt.reactor.vtable.bind(rt.reactor.ctx, rt.executer(), socket, address, length);
+    return rt.reactor.vtable.writevStream(rt.reactor.ctx, rt.executer(), stream, iovecs);
 }
 
-fn listen(ctx: ?*anyopaque, socket: Runtime.Socket, backlog: u32) Runtime.Socket.ListenError!void {
+fn readStream(ctx: ?*anyopaque, stream: Runtime.net.Stream, buffer: []u8) Runtime.net.Stream.ReadError!usize {
     const rt: *Fibers = @alignCast(@ptrCast(ctx));
-    try rt.reactor.vtable.listen(rt.reactor.ctx, rt.executer(), socket, backlog);
+    return rt.reactor.vtable.readStream(rt.reactor.ctx, rt.executer(), stream, buffer);
 }
 
-fn connect(ctx: ?*anyopaque, socket: Runtime.Socket, address: *const Runtime.Socket.Address) Runtime.Poller(Runtime.Socket.ConnectError!void) {
+fn readvStream(ctx: ?*anyopaque, stream: Runtime.net.Stream, iovecs: []const Runtime.net.Stream.iovec) Runtime.net.Stream.ReadError!usize {
     const rt: *Fibers = @alignCast(@ptrCast(ctx));
-    return rt.reactor.vtable.connect(rt.reactor.ctx, rt.executer(), socket, address);
+    return rt.reactor.vtable.readvStream(rt.reactor.ctx, rt.executer(), stream, iovecs);
 }
 
-fn accept(ctx: ?*anyopaque, socket: Runtime.Socket) Runtime.Poller(Runtime.Socket.AcceptError!Runtime.Socket) {
+fn closeStream(ctx: ?*anyopaque, stream: Runtime.net.Stream) void {
     const rt: *Fibers = @alignCast(@ptrCast(ctx));
-    return rt.reactor.vtable.accept(rt.reactor.ctx, rt.executer(), socket);
+    rt.reactor.vtable.closeStream(rt.reactor.ctx, rt.executer(), stream);
 }
 
-fn send(ctx: ?*anyopaque, socket: Runtime.Socket, buffer: []const u8, flags: Runtime.Socket.SendFlags) Runtime.Poller(Runtime.Socket.SendError!usize) {
+fn closeServer(ctx: ?*anyopaque, server: Runtime.net.Server) void {
     const rt: *Fibers = @alignCast(@ptrCast(ctx));
-    return rt.reactor.vtable.send(rt.reactor.ctx, rt.executer(), socket, buffer, flags);
-}
-
-fn sendv(ctx: ?*anyopaque, socket: Runtime.Socket, buffers: []const Runtime.Socket.iovec) Runtime.Poller(Runtime.Socket.SendError!usize) {
-    const rt: *Fibers = @alignCast(@ptrCast(ctx));
-    return rt.reactor.vtable.sendv(rt.reactor.ctx, rt.executer(), socket, buffers);
-}
-
-fn recv(ctx: ?*anyopaque, socket: Runtime.Socket, buffer: []u8, flags: Runtime.Socket.RecvFlags) Runtime.Poller(Runtime.Socket.RecvError!usize) {
-    const rt: *Fibers = @alignCast(@ptrCast(ctx));
-    return rt.reactor.vtable.recv(rt.reactor.ctx, rt.executer(), socket, buffer, flags);
+    rt.reactor.vtable.closeServer(rt.reactor.ctx, rt.executer(), server);
 }
 
 fn getStdIn(ctx: ?*anyopaque) Runtime.File {

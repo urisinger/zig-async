@@ -1,10 +1,13 @@
 const std = @import("std");
-const Runtime = @import("Runtime.zig");
-const File = @import("Runtime.zig").File;
-const Socket = @import("Runtime.zig").Socket;
-const Cancelable = @import("Runtime.zig").Cancelable;
+const Runtime = @import("runtime/Runtime.zig");
+const File = Runtime.File;
+const Cancelable = Runtime.Cancelable;
 
 const fs = std.fs;
+
+const net = Runtime.net;
+const Server = net.Server;
+const Stream = net.Stream;
 
 pub const Executer = struct {
     pub const VTable = struct {
@@ -51,32 +54,27 @@ pub const VTable = struct {
     // if cur_thread_ctx is null, the wakeThread is called from a thread that does not have a context.
     wakeThread: *const fn (global_ctx: ?*anyopaque, cur_thread_ctx: ?*anyopaque, other_thread_ctx: ?*anyopaque) void,
 
-    destroyPoller: *const fn (global_ctx: ?*anyopaque, executer: Executer, poller: Runtime.AnyPoller) void,
-
     //createFile: *const fn (global_ctx: ?*anyopaque, executer: Executer, path: []const u8, flags: File.CreateFlags) File.OpenError!File,
     openFile: *const fn (global_ctx: ?*anyopaque, executer: Executer, path: []const u8, flags: File.OpenFlags) File.OpenError!File,
     closeFile: *const fn (global_ctx: ?*anyopaque, executer: Executer, File) void,
 
     getStdIn: *const fn (global_ctx: ?*anyopaque, executer: Executer) File,
 
-    pread: *const fn (global_ctx: ?*anyopaque, executer: Executer, file: File, buffer: []u8, offset: std.posix.off_t) Runtime.Poller(File.PReadError!usize),
+    pread: *const fn (global_ctx: ?*anyopaque, executer: Executer, file: File, buffer: []u8, offset: std.posix.off_t) File.PReadError!usize,
 
-    pwrite: *const fn (global_ctx: ?*anyopaque, executer: Executer, file: File, buffer: []const u8, offset: std.posix.off_t) Runtime.Poller(File.PWriteError!usize),
+    pwrite: *const fn (global_ctx: ?*anyopaque, executer: Executer, file: File, buffer: []const u8, offset: std.posix.off_t) File.PWriteError!usize,
 
-    createSocket: *const fn (global_ctx: ?*anyopaque, executer: Executer, domain: Socket.Domain, protocol: Socket.Protocol) Runtime.Poller(Socket.CreateError!Socket),
-    closeSocket: *const fn (global_ctx: ?*anyopaque, executer: Executer, socket: Socket) void,
-    setsockopt: *const fn (global_ctx: ?*anyopaque, executer: Executer, socket: Socket, option: Socket.Option) Socket.SetOptError!void,
+    listen: *const fn (global_ctx: ?*anyopaque, executer: Executer, address: net.Address, options: Server.ListenOptions) Server.ListenError!Server,
+    accept: *const fn (global_ctx: ?*anyopaque, executer: Executer, server: Server) Server.AcceptError!Stream,
 
-    bind: *const fn (global_ctx: ?*anyopaque, executer: Executer, socket: Socket, address: *const Socket.Address, length: u32) Socket.BindError!void,
-    listen: *const fn (global_ctx: ?*anyopaque, executer: Executer, socket: Socket, backlog: u32) Socket.ListenError!void,
+    writeStream: *const fn (global_ctx: ?*anyopaque, executer: Executer, stream: Stream, buffer: []const u8) Stream.WriteError!usize,
+    writevStream: *const fn (global_ctx: ?*anyopaque, executer: Executer, stream: Stream, iovecs: []const Stream.iovec_const) Stream.WriteError!usize,
 
-    connect: *const fn (global_ctx: ?*anyopaque, executer: Executer, socket: Socket, address: *const Socket.Address) Runtime.Poller(Socket.ConnectError!void),
+    readStream: *const fn (global_ctx: ?*anyopaque, executer: Executer, stream: Stream, buffer: []u8) Stream.ReadError!usize,
+    readvStream: *const fn (global_ctx: ?*anyopaque, executer: Executer, stream: Stream, iovecs: []const Stream.iovec) Stream.ReadError!usize,
 
-    accept: *const fn (global_ctx: ?*anyopaque, executer: Executer, socket: Socket) Runtime.Poller(Socket.AcceptError!Socket),
-
-    send: *const fn (global_ctx: ?*anyopaque, executer: Executer, socket: Socket, buffer: []const u8, flags: Socket.SendFlags) Runtime.Poller(Socket.SendError!usize),
-    sendv: *const fn (global_ctx: ?*anyopaque, executer: Executer, socket: Socket, buffers: []const Socket.iovec) Runtime.Poller(Socket.SendError!usize),
-    recv: *const fn (global_ctx: ?*anyopaque, executer: Executer, socket: Socket, buffer: []u8, flags: Socket.RecvFlags) Runtime.Poller(Socket.RecvError!usize),
+    closeStream: *const fn (global_ctx: ?*anyopaque, executer: Executer, stream: Stream) void,
+    closeServer: *const fn (global_ctx: ?*anyopaque, executer: Executer, server: Server) void,
 
     sleep: *const fn (global_ctx: ?*anyopaque, executer: Executer, timestamp: u64) Cancelable!void,
 };

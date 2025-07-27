@@ -1,8 +1,9 @@
 const std = @import("std");
 const log = std.log.scoped(.EventLoop);
 
-const Runtime = @import("../../Runtime.zig");
-const Reactor = @import("../../Reactor.zig");
+const root = @import("zig_io");
+const Runtime = root.Runtime;
+const Reactor = root.Reactor;
 const fs = @import("./fs.zig");
 const net = @import("./net.zig");
 
@@ -19,7 +20,6 @@ allocator: Allocator,
 pub const ThreadContext = struct {
     event_loop: *EventLoop,
     io_uring: IoUring,
-    ops_buffer: std.heap.MemoryPool(Operation),
 
     sqe_overflow: std.fifo.LinearFifo(std.os.linux.io_uring_sqe, .Dynamic),
 
@@ -31,14 +31,12 @@ pub const ThreadContext = struct {
             .io_uring = IoUring.init(io_uring_entries, 0) catch unreachable,
             .event_loop = event_loop,
             .wake_fd = @intCast(wake_fd),
-            .ops_buffer = std.heap.MemoryPool(Operation).init(event_loop.allocator),
             .sqe_overflow = std.fifo.LinearFifo(std.os.linux.io_uring_sqe, .Dynamic).init(event_loop.allocator),
         };
     }
 
     pub fn deinit(self: *ThreadContext) void {
         self.io_uring.deinit();
-        self.ops_buffer.deinit();
         self.sqe_overflow.deinit();
     }
 
@@ -52,16 +50,6 @@ pub const ThreadContext = struct {
             self.sqe_overflow.update(1);
             return &self.sqe_overflow.buf[tail];
         };
-    }
-
-    pub fn getOp(self: *ThreadContext) !*Operation {
-        return self.ops_buffer.create();
-    }
-
-    pub fn destroyOp(self: *ThreadContext, op: *Operation) void {
-        _ = self;
-        _ = op;
-        //self.ops_buffer.destroy(op);
     }
 };
 
@@ -99,23 +87,20 @@ const vtable: Reactor.VTable = .{
     .createContext = createContext,
     .destroyContext = destroyContext,
     .onPark = onPark,
-    .destroyPoller = destroyPoller,
     .openFile = fs.openFile,
     .closeFile = fs.closeFile,
     .pread = fs.pread,
     .pwrite = fs.pwrite,
     .wakeThread = wakeThread,
     .sleep = sleep,
-    .createSocket = net.createSocket,
-    .closeSocket = net.closeSocket,
-    .setsockopt = net.setsockopt,
-    .bind = net.bind,
     .listen = net.listen,
-    .connect = net.connect,
     .accept = net.accept,
-    .send = net.send,
-    .sendv = net.sendv,
-    .recv = net.recv,
+    .writeStream = net.writeStream,
+    .writevStream = net.writevStream,
+    .readStream = net.readStream,
+    .readvStream = net.readvStream,
+    .closeStream = net.closeStream,
+    .closeServer = net.closeServer,
     .getStdIn = fs.getStdIn,
 };
 
@@ -135,11 +120,8 @@ fn sleep(ctx: ?*anyopaque, exec: Reactor.Executer, ms: u64) Cancelable!void {
     const sqe = thread_ctx.getSqe() catch {
         @panic("failed to get sqe");
     };
-    const op = thread_ctx.getOp() catch {
-        @panic("failed to get op");
-    };
 
-    op.* = .{
+    var op: Operation = .{
         .waker = exec.getWaker(),
         .result = 0,
         .has_result = false,
@@ -151,7 +133,7 @@ fn sleep(ctx: ?*anyopaque, exec: Reactor.Executer, ms: u64) Cancelable!void {
         .nsec = @intCast((ms % 1000) * 1000000),
     };
     sqe.prep_timeout(&ts, 0, 0);
-    sqe.user_data = @intFromPtr(op);
+    sqe.user_data = @intFromPtr(&op);
 
     while (true) {
         if (exec.@"suspend"()) {
@@ -160,10 +142,10 @@ fn sleep(ctx: ?*anyopaque, exec: Reactor.Executer, ms: u64) Cancelable!void {
         if (op.has_result) {
             switch (errno(op.result)) {
                 .SUCCESS => {
-                    op.has_result = false;
+                    return;
                 },
                 .TIME => {
-                    break;
+                    return;
                 },
                 else => |err| {
                     log.err("sleep failed: {any}", .{err});
@@ -172,14 +154,6 @@ fn sleep(ctx: ?*anyopaque, exec: Reactor.Executer, ms: u64) Cancelable!void {
             }
         }
     }
-    thread_ctx.destroyOp(op);
-}
-
-fn destroyPoller(global_ctx: ?*anyopaque, exec: Reactor.Executer, poller: Runtime.AnyPoller) void {
-    _ = global_ctx;
-    const thread_ctx: *ThreadContext = @alignCast(@ptrCast(exec.getThreadContext()));
-    const op: *Operation = @alignCast(@ptrCast(poller.poller_ctx));
-    thread_ctx.destroyOp(op);
 }
 
 fn wakeThread(global_ctx: ?*anyopaque, cur_thread_ctx: ?*anyopaque, other_thread_ctx: ?*anyopaque) void {
@@ -262,7 +236,6 @@ fn onPark(global_ctx: ?*anyopaque, exec: Reactor.Executer) void {
             // user_data points to an Operation in the buffer
             const op: *Operation = @ptrFromInt(cqe.user_data);
             if (op.has_result) {
-                thread_ctx.destroyOp(op);
                 continue;
             }
 
