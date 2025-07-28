@@ -30,9 +30,27 @@ pub const Stream = struct {
         return rt.vtable.writevStream(rt.ctx, stream, iovecs);
     }
 
+    pub fn writevAll(stream: Stream, rt: Runtime, iovecs: []iovec_const) WriteError!void {
+        if (iovecs.len == 0) return;
+
+        var i: usize = 0;
+        while (true) {
+            var amt = try stream.writev(rt, iovecs[i..]);
+            while (amt >= iovecs[i].len) {
+                amt -= iovecs[i].len;
+                i += 1;
+                if (i >= iovecs.len) return;
+            }
+            iovecs[i].base += amt;
+            iovecs[i].len -= amt;
+        }
+
+    }
+
     pub fn readv(stream: Stream, rt: Runtime, iovecs: []const iovec) ReadError!usize {
         return rt.vtable.readvStream(rt.ctx, stream, iovecs);
     }
+
 
     pub fn close(stream: Stream, rt: Runtime) void {
         return rt.vtable.closeStream(rt.ctx, stream);
