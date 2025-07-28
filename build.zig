@@ -5,12 +5,11 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
 
     // Library module
-    const lib_mod = b.createModule(.{
+    const lib_mod = b.addModule("zig_async",.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = optimize,
     });
-
     lib_mod.addImport("zig_async", lib_mod);
 
     // Build static library
@@ -20,11 +19,6 @@ pub fn build(b: *std.Build) void {
         .root_module = lib_mod,
     });
     b.installArtifact(lib);
-
-    // Export module for other projects
-    _ = b.addModule("zig_async", .{
-        .root_source_file = b.path("src/main.zig"),
-    });
 
     // Echo example executable
     const echo_exe = b.addExecutable(.{
