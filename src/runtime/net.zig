@@ -22,8 +22,22 @@ pub const Stream = struct {
         return rt.vtable.writeStream(rt.ctx, stream, buffer);
     }
 
+    pub fn writeAll(stream: Stream, rt: Runtime, buffer: []const u8) WriteError!void{
+        var index: usize = 0;
+        while (index < buffer.len) {
+            index += try stream.write(rt, buffer[index..]);
+        }
+    }
+
     pub fn read(stream: Stream, rt: Runtime, buffer: []u8) ReadError!usize {
         return rt.vtable.readStream(rt.ctx, stream, buffer);
+    }
+
+    pub fn readAll(stream: Stream, rt: Runtime, buffer: []u8) ReadError!void{
+        var index: usize = 0;
+        while (index < buffer.len) {
+            index += try stream.read(rt, buffer[index..]);
+        }
     }
 
     pub fn writev(stream: Stream, rt: Runtime, iovecs: []const iovec_const) WriteError!usize {
