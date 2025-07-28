@@ -1,4 +1,4 @@
-const root = @import("zig_io");
+const root = @import("zig_async");
 const Runtime = root.Runtime;
 const Fibers = root.Fibers;
 const Uring = root.Uring;

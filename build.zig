@@ -11,18 +11,18 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
-    lib_mod.addImport("zig_io", lib_mod);
+    lib_mod.addImport("zig_async", lib_mod);
 
     // Build static library
     const lib = b.addLibrary(.{
         .linkage = .static,
-        .name = "zig_io",
+        .name = "zig_async",
         .root_module = lib_mod,
     });
     b.installArtifact(lib);
 
     // Export module for other projects
-    _ = b.addModule("zig_io", .{
+    _ = b.addModule("zig_async", .{
         .root_source_file = b.path("src/main.zig"),
     });
 
@@ -33,7 +33,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    echo_exe.root_module.addImport("zig_io", lib_mod);
+    echo_exe.root_module.addImport("zig_async", lib_mod);
     b.installArtifact(echo_exe);
 
     // Echo run command

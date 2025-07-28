@@ -1,6 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
-const root = @import("zig_io");
+const root = @import("zig_async");
 
 const Alignment = std.mem.Alignment;
 

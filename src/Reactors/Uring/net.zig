@@ -1,6 +1,6 @@
 const std = @import("std");
 
-const root = @import("zig_io");
+const root = @import("zig_async");
 const Runtime = root.Runtime;
 const Reactor = root.Reactor;
 

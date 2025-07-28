@@ -1,7 +1,7 @@
 const std = @import("std");
 const log = std.log.scoped(.EventLoop);
 
-const root = @import("zig_io");
+const root = @import("zig_async");
 const Runtime = root.Runtime;
 const Reactor = root.Reactor;
 const fs = @import("./fs.zig");
