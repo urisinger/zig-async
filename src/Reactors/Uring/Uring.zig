@@ -13,7 +13,7 @@ const Cancelable = Runtime.Cancelable;
 
 const EventLoop = @This();
 
-const io_uring_entries = 64;
+const io_uring_entries = 1024;
 
 allocator: Allocator,
 
