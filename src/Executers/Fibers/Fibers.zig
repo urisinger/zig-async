@@ -48,6 +48,7 @@ shutdown: struct {
 reactor: Reactor,
 const rt_vtable: Runtime.VTable = .{
     .spawn = spawn,
+    .spawnDetached = spawnDetached,
     .@"await" = @"await",
     .cancel = cancel,
     .select = select,
@@ -217,6 +218,7 @@ const Task = union(enum) {
         result_alignment: Alignment,
 
         state: std.atomic.Value(TaskState),
+        detached: bool,
         canceled: std.atomic.Value(bool),
 
         completed: std.atomic.Value(bool),
@@ -236,6 +238,7 @@ const Task = union(enum) {
             context_alignment: Alignment,
             result_len: usize,
             result_alignment: Alignment,
+            detached: bool,
         ) !*Detached {
             const stack_mem = std.heap.PageAllocator.map(stack_size, page_align) orelse return error.OutOfMemory;
             const stack_bottom = @intFromPtr(stack_mem);
@@ -303,6 +306,7 @@ const Task = union(enum) {
                 .completed = .init(false),
                 .canceled = .init(false),
                 .index = undefined,
+                .detached = detached,
             };
 
             return task;
@@ -512,6 +516,10 @@ const Thread = struct {
                     t.state.store(.Queued, .release);
                     rt.reschedule(t);
                 }
+
+                if (t.completed.load(.acquire)) {
+                    t.deinit();
+                }
             }
 
             if (rt.shutdown.task_count.load(.acquire) == 0) {
@@ -560,13 +568,7 @@ fn spawn(
 ) *Runtime.AnySpawnHandle {
     const rt: *Fibers = @alignCast(@ptrCast(ctx));
 
-    const task = Task.Detached.init(
-        start,
-        context,
-        context_alignment,
-        result_len,
-        result_alignment,
-    ) catch unreachable;
+    const task = Task.Detached.init(start, context, context_alignment, result_len, result_alignment, false) catch unreachable;
 
     rt.detached_tasks.mutex.lock();
     const index = rt.detached_tasks.list.items.len;
@@ -579,6 +581,28 @@ fn spawn(
     rt.schedule(task);
 
     return @ptrCast(task);
+}
+
+fn spawnDetached(
+    ctx: ?*anyopaque,
+    context: []const u8,
+    context_alignment: std.mem.Alignment,
+    start: *const fn (context: *const anyopaque, result: *anyopaque) void,
+) void {
+    const rt: *Fibers = @alignCast(@ptrCast(ctx));
+
+    const task = Task.Detached.init(start, context, context_alignment, 0, Alignment.@"1", true) catch unreachable;
+
+    rt.detached_tasks.mutex.lock();
+    const index = rt.detached_tasks.list.items.len;
+    rt.detached_tasks.list.append(task) catch unreachable;
+    rt.detached_tasks.mutex.unlock();
+    task.index = index;
+
+    _ = rt.shutdown.task_count.fetchAdd(1, .acq_rel);
+
+    rt.schedule(task);
+
 }
 
 pub fn @"await"(ctx: ?*anyopaque, handle: *Runtime.AnySpawnHandle, result: *anyopaque) void {

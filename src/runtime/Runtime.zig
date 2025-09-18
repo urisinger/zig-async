@@ -26,6 +26,15 @@ pub const VTable = struct {
         start: *const fn (context: *const anyopaque, result: *anyopaque) void,
     ) *AnySpawnHandle,
 
+    spawnDetached: *const fn (
+        /// Corresponds to `runtime.ctx`.
+        ctx: ?*anyopaque,
+        /// Copied and then passed to `start`.
+        context: []const u8,
+        context_alignment: std.mem.Alignment,
+        start: *const fn (context: *const anyopaque, result: *anyopaque) void,
+    ) void,
+
     @"await": *const fn (ctx: ?*anyopaque, task: *AnySpawnHandle, result: *anyopaque) void,
 
     cancel: *const fn (ctx: ?*anyopaque, task: *AnySpawnHandle) void,
